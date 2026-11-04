@@ -301,7 +301,7 @@ with, or endorsed by, the pyatv project.
 
 | Project | Used for | License |
 | --- | --- | --- |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Finding the real video address behind web pages (used as a library) | Unlicense |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Finding the real video address behind web pages (read as a library, and run to stream the video) | Unlicense |
 | [FFmpeg](https://ffmpeg.org) | Inspecting and converting video (run as a separate program) | LGPL/GPL |
 | [aiohttp](https://github.com/aio-libs/aiohttp) | The small HTTP servers the TV downloads from | Apache-2.0 |
 | [ifaddr](https://github.com/ifaddr/ifaddr) | Listing network interfaces so discovery works with VPNs | MIT |
