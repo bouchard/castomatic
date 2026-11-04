@@ -12,14 +12,14 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, List, Optional
 
 import aiohttp
 from pyatv import exceptions as pyatv_exceptions
 
-from pyatv_cast import config, dlna, hls, sources, stream, subtitles, targets
+from pyatv_cast import buffering, config, dlna, hls, sources, stream, subtitles, targets, ytstream
 from pyatv_cast.errors import UPNP_HINTS, UserError
 from pyatv_cast.airplay import AirPlayError, AirPlayPlayer
 from pyatv_cast.live import LiveHls
@@ -38,7 +38,11 @@ PYATV_ERRORS = (
     pyatv_exceptions.BackOffError,
     pyatv_exceptions.PlaybackError,
 )
+_LOGGER = logging.getLogger(__name__)
+
 START_WATCH_SECONDS = 25.0
+FEED_INTERVAL = 2.0  # seconds between checks of how far ahead the copy is
+RESTARTS = 5  # an AirPlay receiver that drops the video is given it again this often
 WATCH_INTERVAL = 2.0
 EXAMPLES = """\
 examples:
@@ -67,6 +71,16 @@ def choose_delivery(
 ) -> Delivery:
     """Pick the least invasive way to get ``source`` to a DLNA renderer."""
     reasons = stream.conversion_reasons(summary, source.location, sink)
+    if source.relay is not None:
+        # yt-dlp's MPEG-TS, buffered here: sent as it is when the TV takes its codecs,
+        # otherwise converted by ffmpeg reading our buffer (never the site)
+        reasons = [r for r in reasons if not r.startswith("the TV does not list")]
+        if mode == "convert":
+            reasons = reasons or ["--mode convert"]
+        # Always through ffmpeg (copying whatever the TV takes): yt-dlp's raw MPEG-TS played
+        # with audio and video noticeably out of sync on a Samsung, a clean remux does not.
+        # It also lets ffmpeg skip ahead for --start, which the buffer cannot.
+        return Delivery("stream", reasons)
     if source.via_ytdlp or len(source.inputs) > 1:
         # Resolved addresses are signed, need headers or come as separate video and audio
         return Delivery("stream", [])
@@ -129,6 +143,20 @@ async def _find_subtitle(args: argparse.Namespace, source: sources.MediaSource) 
         raise UserError(str(ex), "Check the path given to --subtitles.") from ex
 
 
+async def _subtitle_for(args, source, buffered) -> Optional[Any]:
+    """The subtitle to use, leaving out one that would mean reading a slow drive end to end."""
+    sub = await _find_subtitle(args, source)
+    if not buffered:
+        return sub
+    usable = buffered.subtitle(sub)
+    if sub and not usable:
+        print(
+            "note: the subtitles inside this video need all of it, so they are left out this "
+            "time; they will be there when it is played from the finished copy."
+        )
+    return usable
+
+
 async def _ticker(started: float, duration: Optional[float]) -> None:
     while True:
         elapsed = time.monotonic() - started
@@ -183,6 +211,8 @@ async def _play_dlna(
     summary: stream.Summary,
     target: targets.Target,
     workdir: Optional[Path],
+    buffered: Optional[buffering.BufferedMedia] = None,
+    fallback: Optional[buffering.Fallback] = None,
 ) -> None:
     tv = target.tv
     player = dlna.DlnaPlayer(tv.renderer)
@@ -198,18 +228,43 @@ async def _play_dlna(
         sink = await player.sink_types()
         supports_hls = any("mpegurl" in m for m in sink)
         delivery = choose_delivery(args.mode, source, summary, sink, supports_hls)
-        sub = await _find_subtitle(args, source)
-        url, server, mime, start = await _prepare_dlna(
-            args, source, summary, delivery, sink, sub, player, workdir
-        )
-        player.mime = mime
-        _announce(delivery, server)
-        await player.play(
-            url, title=source.title, start=start,
-            subtitle_url=getattr(server, "subtitle_url", None),
-        )  # fmt: skip
-        print(f"Playing on {tv.name}. Press Ctrl-C to stop.")
-        await _wait(player, server, tv.name, source, summary, args)
+        sub = await _subtitle_for(args, source, buffered)
+        duration = summary.duration or source.duration
+
+        async def start_playing(at: float) -> float:
+            """Serve the video and start it at ``at`` seconds; returns the renderer's shift."""
+            nonlocal server
+            reading = source
+            if buffered and delivery.kind == "stream":  # ffmpeg reads the copy, not the drive
+                reading = replace(source, inputs=[sources.Input(buffered.url)])
+            now = argparse.Namespace(**{**vars(args), "start": at})
+            url, server, mime, start = await _prepare_dlna(
+                now, reading, summary, delivery, sink, sub, player, workdir, buffered
+            )
+            if buffered:  # a renderer asked to start part way plays the opening first
+                await _buffer_gate(buffered, at, duration, opening=start > 0)
+            player.mime = mime
+            _announce(delivery, server)
+            await player.play(
+                url, title=source.title, start=start,
+                subtitle_url=getattr(server, "subtitle_url", None),
+            )  # fmt: skip
+            print(f"Playing on {tv.name}. Press Ctrl-C to stop.")
+            return at - start
+
+        shift = await start_playing(args.start)
+        watch = None if buffered else fallback
+        reached = await _wait(player, server, tv.name, source, summary, args, buffered, shift, watch)
+        if reached is not None:
+            buffered = fallback.media
+            if delivery.kind == "hls":  # the same segments, from the next one on
+                server.use_source(buffered.url)
+            else:  # the renderer is tied to the old address: reload it where it was
+                await _hold(player)
+                await server.stop()
+                server = None
+                shift = await start_playing(reached)
+            await _wait(player, server, tv.name, source, summary, args, buffered, shift)
     except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
         raise _lost_contact(tv.name, ex) from ex
     except dlna.DlnaError as ex:
@@ -223,7 +278,7 @@ async def _play_dlna(
             print(f"\nffmpeg reported: {server.last_error}")
 
 
-async def _prepare_dlna(args, source, summary, delivery, sink, sub, player, workdir):
+async def _prepare_dlna(args, source, summary, delivery, sink, sub, player, workdir, buffered=None):
     """Start whatever serves the media, returning (url, server, mime, start for the TV)."""
     ip = player.local_ip
     kind = delivery.kind
@@ -231,7 +286,9 @@ async def _prepare_dlna(args, source, summary, delivery, sink, sub, player, work
         return source.location, None, stream.matching_mime(source.location, sink), args.start
     if kind == "file":
         sub = await _check_subtitle(sub, "srt")
-        server = dlna.DirectFileServer(source.path, ip, subtitle=sub)
+        server = dlna.DirectFileServer(
+            source.path, ip, subtitle=sub, respond=buffered.respond if buffered else None
+        )
         mime = stream.matching_mime(source.location, sink)
         return await server.start(), server, mime, args.start
     if kind == "static":
@@ -239,9 +296,9 @@ async def _prepare_dlna(args, source, summary, delivery, sink, sub, player, work
         return await server.start(), server, HLS_MIME, args.start
     if kind == "hls":
         sub = await _check_subtitle(sub, "webvtt")
-        media = await hls.plan(source.path, sub)
+        media = await (buffered.plan(sub, _print_progress) if buffered else hls.plan(source.path, sub))
         url, server = await _hls_server(args, media, ip, workdir)
-        return url, server, HLS_MIME, args.start
+        return url, server, HLS_MIME, media.playable_start(args.start)
     plan = stream.make_plan(source.inputs, summary, force_convert=args.mode == "convert")
     sub = await _check_subtitle(sub, "srt", args.start)
     server = stream.StreamServer(plan, ip, start=args.start, subtitle=sub)
@@ -253,7 +310,8 @@ async def _prepare_dlna(args, source, summary, delivery, sink, sub, player, work
 
 async def _hls_server(args, media, ip, workdir):
     if args.no_jit:
-        print(f"Converting {media.source.name} ({len(media.segments)} segments) ...")
+        name = getattr(media.source, "name", "the video")
+        print(f"Converting {name} ({len(media.segments)} segments) ...")
         server = hls.StaticHlsServer(await hls.convert_to_directory(media, workdir), ip)
     else:
         server = hls.JitHlsServer(media, ip)
@@ -274,11 +332,105 @@ def _announce(delivery: Delivery, server: Any) -> None:
         print(f"Converting just in time{suffix}: {what}.")
 
 
-async def _wait(player, server, tv_name, source, summary, args) -> None:
+async def _keep_fed(player, buffered, duration: float, shift: float) -> None:
+    """Wait for the end, holding the renderer if it gets close to the end of the copy.
+
+    Renderers react to an HTTP read that goes quiet in their own ways, many by giving up,
+    so it is paused while there is still time. ``shift`` is the video time the renderer's
+    position 0 is at (a live stream starts where it was asked to).
+    """
+    cache = buffered.cache
+    ended = asyncio.ensure_future(player.wait_until_ended())
+    try:
+        while not cache.complete:
+            done, _ = await asyncio.wait({ended}, timeout=FEED_INTERVAL)
+            if done:
+                return
+            seconds = await player.position()
+            offset = cache.position if seconds is None else buffered.offset_at(seconds + shift, duration)
+            if buffered.running_dry(offset, duration) and await _hold(player):
+                await buffered.fill_ahead(offset, duration, _buffer_status)
+                print("\r  Buffered enough to carry on." + " " * 40)
+                await _release(player)
+        await ended
+    finally:
+        ended.cancel()
+
+
+async def _hold(player) -> bool:
+    """Pause a renderer that is playing. False if it isn't, or will not pause."""
+    try:
+        if await player.state() not in ("PLAYING", "TRANSITIONING"):
+            return False
+        await player.pause()
+        return True
+    except (dlna.DlnaError, aiohttp.ClientError, asyncio.TimeoutError) as ex:
+        _LOGGER.debug("renderer would not pause: %s", ex)
+        return False
+
+
+async def _release(player) -> None:
+    try:
+        await player.resume()
+    except (dlna.DlnaError, aiohttp.ClientError, asyncio.TimeoutError) as ex:
+        _LOGGER.debug("renderer would not resume: %s", ex)
+
+
+async def _watch_direct(player, fallback, start: float, shift: float) -> Optional[float]:
+    """Wait for the end of a video playing directly from its file.
+
+    If the file stops keeping up, opens the copy and returns the time reached instead.
+    """
+    began = time.monotonic()
+    reached = {"last": None, "moving": False}
+
+    async def stalled() -> bool:
+        """Whether a renderer that says it is playing has stopped getting anywhere."""
+        try:
+            state = await player.state()
+        except (dlna.DlnaError, aiohttp.ClientError, asyncio.TimeoutError):
+            return False
+        seconds = await player.position()
+        last, reached["last"] = reached["last"], seconds
+        if seconds is None or last is None or state not in ("PLAYING", "TRANSITIONING"):
+            return False
+        if seconds == last:
+            return reached["moving"]
+        reached["moving"] = True
+        return False
+
+    ended = asyncio.ensure_future(player.wait_until_ended())
+    slowed = asyncio.ensure_future(fallback.slowed(stalled))
+    try:
+        await asyncio.wait({ended, slowed}, return_when=asyncio.FIRST_COMPLETED)
+        if ended.done():
+            return None
+        slowed.result()
+        if await fallback.open() is None:
+            await ended
+            return None
+        seconds = await player.position()
+        if seconds is None:  # the renderer won't say: as far as the clock has gone
+            return start + time.monotonic() - began
+        return seconds + shift
+    finally:
+        ended.cancel()
+        slowed.cancel()
+
+
+async def _wait(
+    player, server, tv_name, source, summary, args, buffered=None, shift=0.0, watch=None
+) -> Optional[float]:
+    """Wait for the end. With ``watch``, returns the time reached if a switch is needed."""
     duration = summary.duration or source.duration
     ticker = asyncio.ensure_future(_ticker(time.monotonic(), duration))
     watcher = asyncio.ensure_future(_watch_start(player, server, tv_name))
     try:
+        if buffered:  # holding for the drive can take as long as it takes
+            await _keep_fed(player, buffered, duration, shift)
+            return None
+        if watch:
+            return await _watch_direct(player, watch, args.start, shift)
         limit = (duration - args.start + 30) if duration else None
         await asyncio.wait_for(player.wait_until_ended(), limit)
     except asyncio.TimeoutError:
@@ -287,6 +439,15 @@ async def _wait(player, server, tv_name, source, summary, args) -> None:
         ticker.cancel()
         watcher.cancel()
         print()
+    return None
+
+
+async def _swap_when_slow(fallback: buffering.Fallback, server: Any) -> None:
+    """Move HLS segments onto a copy if the file stops keeping up. Nothing to interrupt."""
+    await fallback.slowed()
+    media = await fallback.open()
+    if media:
+        server.use_source(media.url)
 
 
 async def _play_airplay(
@@ -295,12 +456,15 @@ async def _play_airplay(
     summary: stream.Summary,
     target: targets.Target,
     workdir: Optional[Path],
+    buffered: Optional[buffering.BufferedMedia] = None,
+    fallback: Optional[buffering.Fallback] = None,
 ) -> None:
     tv = target.tv
     info = tv.airplay
     player = AirPlayPlayer(info.address, info.port, info.credentials)
     server: Any = None
     live: Optional[LiveHls] = None
+    swap: Optional["asyncio.Future[None]"] = None
     try:
         try:
             await player.connect()
@@ -331,14 +495,45 @@ async def _play_airplay(
             if args.subtitles:
                 print("note: subtitles are not sent while streaming live; add --download-first.")
         else:
-            sub = await _check_subtitle(await _find_subtitle(args, source), "webvtt")
-            media = await hls.plan(source.path, sub)
+            sub = await _subtitle_for(args, source, buffered)
+            sub = await _check_subtitle(sub, "webvtt")
+            media = await (
+                buffered.plan(sub, _print_progress) if buffered else hls.plan(source.path, sub)
+            )
             url, server = await _hls_server(args, media, player.local_ip, workdir)
+            start = media.playable_start(start)
+            if buffered:
+                await _buffer_gate(buffered, args.start, summary.duration or source.duration)
+            elif fallback:
+                swap = asyncio.ensure_future(_swap_when_slow(fallback, server))
             if sub:
                 print("Subtitles are offered as a track: choose them in the TV's own subtitle menu.")
         await player.play(url, title=source.title, start=start)
         print(f"Playing on {tv.name} over AirPlay. Press Ctrl-C to stop.")
-        await _wait_airplay(player, summary.duration or source.duration, args, live)
+        duration = summary.duration or source.duration
+        for _ in range(RESTARTS):
+            await _wait_airplay(player, duration, args, live, buffered or fallback)
+            if not player.failed:
+                break
+            media = buffered
+            if fallback and not buffered:  # dropping the video is proof enough: use a copy
+                if swap:
+                    swap.cancel()
+                media = fallback.media or await fallback.open()
+                if media and server:
+                    server.use_source(media.url)
+            at = await _restart_point(server, media, duration)
+            # The session the receiver gave up in will not take the video again
+            await player.stop()
+            await player.close()
+            await player.connect()
+            await player.play(url, title=source.title, start=at)
+        else:
+            raise UserError(
+                f"{tv.name} kept stopping the video.",
+                "The video arrives too slowly for it. Play it again: what was copied so far "
+                "is kept, so the next try starts with more of it already here.",
+            )
     except AirPlayError as ex:
         raise UserError(
             f"{tv.name} refused the AirPlay request: {ex}",
@@ -347,6 +542,8 @@ async def _play_airplay(
     except (*PYATV_ERRORS, OSError, asyncio.TimeoutError) as ex:
         raise _lost_contact(tv.name, ex) from ex
     finally:
+        if swap:
+            swap.cancel()
         await player.stop()
         if live:
             await live.stop()
@@ -355,15 +552,35 @@ async def _play_airplay(
         await player.close()
 
 
+async def _restart_point(server: Any, media: Optional[buffering.BufferedMedia], duration) -> float:
+    """After the receiver dropped the video: where to start it again, once that can last."""
+    at = getattr(server, "reached", None)
+    if at is None or media is None:  # nothing would be any different the second time
+        raise UserError(
+            "the TV stopped the video part way.",
+            "It may have been waiting too long for the next part. Try again.",
+        )
+    at = server.media.playable_start(at)
+    print(f"\nnote: the TV gave up waiting for the video; starting again at {at:.0f}s.")
+    await media.wait_ready(at, duration, _buffer_status)
+    print("\r  Buffered enough to carry on." + " " * 40)
+    return at
+
+
 async def _wait_airplay(
-    player: AirPlayPlayer, duration: Optional[float], args, live: Optional[LiveHls] = None
+    player: AirPlayPlayer,
+    duration: Optional[float],
+    args,
+    live: Optional[LiveHls] = None,
+    buffered: Any = None,
 ) -> None:
     ticker = asyncio.ensure_future(_ticker(time.monotonic(), duration))
     waiting = [asyncio.ensure_future(player.wait_until_ended())]
     if live:
         waiting.append(asyncio.ensure_future(live.failed.wait()))
     try:
-        limit = (duration - args.start + 30) if duration else None
+        # Holding for the drive can take as long as it takes
+        limit = (duration - args.start + 30) if duration and not buffered else None
         await asyncio.wait(waiting, timeout=limit, return_when=asyncio.FIRST_COMPLETED)
     finally:
         for task in waiting:
@@ -384,6 +601,75 @@ def _print_progress(done: int, total: Optional[int], speed: Optional[float]) -> 
     of = f" / {size(total)}" if total else ""
     rate = f"  {size(speed)}/s" if speed else ""
     print(f"\r  Downloading  {percent}{size(done)}{of}{rate}   ", end="", flush=True)
+
+
+def _relay_status(have: float, want: float, speed: float) -> None:
+    size = sources.format_size
+    print(f"\r  Buffering  {have:.0f}s of {want:.0f}s of video, {size(speed)}/s   ", end="", flush=True)
+
+
+async def _start_relay(args: argparse.Namespace, source: sources.MediaSource, directory: Path) -> tuple:
+    """Stream a yt-dlp video into a local buffer and wait until playing it cannot run dry.
+
+    Returns the source as the program will now read it (our own buffer, never the site),
+    what is in it, and the two things to stop afterwards.
+    """
+    buffer = ytstream.YtdlpBuffer(source, directory)
+    feed = ytstream.BufferServer(buffer, "127.0.0.1")
+    await buffer.start()
+    try:
+        what = "live stream" if source.is_live else "video"
+        print(f"Buffering the {what} with yt-dlp before playing ...")
+        await buffer.wait_ready(args.start, _relay_status)
+        print("\r  Buffered enough to play without stopping; the rest keeps arriving." + " " * 20)
+        info = await stream.probe_input(sources.Input(str(buffer.path)))
+        summary = replace(stream.summarize([info]), duration=source.duration)  # the buffer is only a part
+        url = await feed.start()
+    except BaseException:
+        await feed.stop()
+        await buffer.stop()
+        raise
+    return replace(source, inputs=[sources.Input(url)], relay=buffer), summary, (buffer, feed)
+
+
+def _buffer_status(have: int, need: int, rate: Optional[float]) -> None:
+    size = sources.format_size
+    speed = f", {size(rate)}/s" if rate else ""
+    eta = ""
+    if rate and need > have:
+        minutes = (need - have) / rate / 60
+        eta = f", about {minutes:.0f} min to go" if minutes >= 1.5 else ", under 2 min to go"
+    print(f"\r  Buffering  {size(have)} of {size(need)} needed{speed}{eta}   ", end="", flush=True)
+
+
+async def _buffer_gate(
+    buffered: buffering.BufferedMedia, start: float, duration: float, opening: bool = False
+) -> None:
+    """Hold playback back until the local copy is far enough ahead that it cannot stall."""
+    if buffered.cache.complete:
+        return
+    await buffered.wait_ready(start, duration, _buffer_status, opening=opening)
+    print("\r  Buffered enough to play without stopping; the rest keeps copying." + " " * 20)
+
+
+async def _finish_copy(buffered: buffering.BufferedMedia) -> None:
+    """After playing, fetch whatever was skipped, so next time needs nothing from the drive."""
+    if buffered.cache.complete:
+        return
+    print("Finishing the local copy (Ctrl-C leaves the rest for next time) ...")
+    await buffered.finish(_print_progress)
+    print()
+
+
+def _copy_report(buffered: buffering.BufferedMedia) -> None:
+    c = buffered.cache
+    if c.complete:
+        print(f"The local copy is complete: {c.path}")
+    else:
+        print(
+            f"The local copy is {100 * c.have_bytes / c.size:.0f}% complete; playing the same "
+            "file again carries on from there."
+        )
 
 
 async def _download_first(
@@ -430,11 +716,17 @@ async def run(args: argparse.Namespace) -> None:
         args.source, args.ytdlp_format, args.cookies_from_browser, args.verbose
     )
     if source.via_ytdlp:
-        print(f"yt-dlp found: {source.title}")
+        print(f"yt-dlp found: {source.title}" + (" (live)" if source.is_live else ""))
+    # A yt-dlp video is streamed by yt-dlp itself into a local buffer and re-streamed from
+    # there; ffmpeg never opens the site's address. --download-first fetches it all instead.
+    relay = source.via_ytdlp and not args.download_first
+    if relay and source.is_live and args.start:
+        raise UserError("--start cannot be used with a live stream.", "A live stream plays from now: leave --start out.")
     summary: Optional[stream.Summary] = None
     must_download = False
     try:
-        summary = stream.summarize([await stream.probe_input(i) for i in source.inputs])
+        if not relay:
+            summary = stream.summarize([await stream.probe_input(i) for i in source.inputs])
     except stream.ProbeError as ex:
         if not source.via_ytdlp:
             raise
@@ -452,22 +744,42 @@ async def run(args: argparse.Namespace) -> None:
         target.protocol == "airplay" and not source.is_local
         and not (source.is_hls_playlist and not source.via_ytdlp)
     )
-    download = must_download or (remote_for_airplay and args.download_first)
+    download = must_download or (args.download_first and (remote_for_airplay or source.via_ytdlp))
     workdir = None
+    buffered: Optional[buffering.BufferedMedia] = None
+    fallback: Optional[buffering.Fallback] = None
+    feed: Optional[tuple] = None
     if args.workdir and not Path(args.workdir).is_dir():
         raise UserError(f"--workdir {args.workdir} is not a folder.", "Create it, or leave --workdir out.")
-    if args.no_jit or remote_for_airplay or download:
+    if args.no_jit or remote_for_airplay or download or relay:
         workdir = tempfile.TemporaryDirectory(prefix="pyatv-cast-", dir=args.workdir)
     try:
         path = Path(workdir.name) if workdir else None
+        if relay:
+            source, summary, feed = await _start_relay(args, source, path)
+        if source.is_local and not source.is_hls_playlist and not download:
+            duration = summary.duration or source.duration
+            note = lambda text: print(f"note: {text}")  # noqa: E731
+            buffered = await buffering.choose(source.path, duration, on_note=note)
+            if not buffered and duration and not args.no_jit:
+                fallback = buffering.Fallback(source.path, duration, on_note=note)
         if download:
             source, summary = await _download_first(args, source, path)
             _check_start(args, summary.duration or source.duration)
         if target.protocol == "dlna":
-            await _play_dlna(args, source, summary, target, path)
+            await _play_dlna(args, source, summary, target, path, buffered, fallback)
         else:
-            await _play_airplay(args, source, summary, target, path)
+            await _play_airplay(args, source, summary, target, path, buffered, fallback)
+        if buffered or (fallback and fallback.media):
+            await _finish_copy(buffered or fallback.media)
     finally:
+        if feed:
+            await feed[1].stop()
+            await feed[0].stop()
+        media = buffered or (fallback.media if fallback else None)
+        if media:
+            await media.close()
+            _copy_report(media)
         if workdir:
             try:
                 workdir.cleanup()

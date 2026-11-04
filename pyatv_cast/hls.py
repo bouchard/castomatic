@@ -11,7 +11,7 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from aiohttp import web
 
@@ -24,6 +24,7 @@ SUBTITLE_NAME = "subs.vtt"
 SEGMENT_TARGET_SECONDS = 6.0
 CACHE_SEGMENTS = 6
 MAX_FFMPEG = 2
+BOUNDARY_NUDGE = 0.5  # seconds: how far into a segment a start that falls on its edge goes
 
 
 @dataclass
@@ -41,7 +42,7 @@ class Segment:
 class MediaPlan:
     """What ffmpeg will do for this source, plus the planned segments."""
 
-    source: Path
+    source: Union[Path, str]  # a file, or the address of one (a local cache server)
     duration: float
     copy_video: bool
     copy_audio: bool
@@ -55,6 +56,17 @@ class MediaPlan:
     # time, which the muxer would otherwise shift for segment 0 only.
     ts_shift: float = 0.0
     segments: List[Segment] = field(default_factory=list)
+
+    def playable_start(self, seconds: float) -> float:
+        """``seconds``, moved off the very start of a segment.
+
+        Asked to start exactly where a segment begins, a receiver (Samsung over AirPlay)
+        can fetch that segment over and over without ever playing it.
+        """
+        for seg in self.segments:
+            if seconds > 0 and abs(seconds - seg.start) < BOUNDARY_NUDGE:
+                return seg.start + min(BOUNDARY_NUDGE, seg.duration / 2)
+        return seconds
 
     @property
     def entry_name(self) -> str:
@@ -117,7 +129,11 @@ async def _run(*args: str) -> bytes:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await proc.communicate()
+    except asyncio.CancelledError:  # nobody wants the result: stop it reading the drive
+        proc.kill()
+        raise
     if proc.returncode != 0:
         raise RuntimeError(f"{args[0]} failed: {err.decode(errors='replace')[-500:]}")
     return out
@@ -147,7 +163,7 @@ def h264_codec_string(profile: Optional[str], level: Optional[int]) -> str:
     return f"avc1.{profile_idc:02X}00{(level or 40):02X}"
 
 
-async def probe(source: Path) -> dict:
+async def probe(source: Union[Path, str]) -> dict:
     """Return stream and format info for ``source`` via ffprobe."""
     out = await _run(
         "ffprobe", "-v", "error", "-print_format", "json",
@@ -199,10 +215,15 @@ def _pick_audio(streams: List[dict]) -> Tuple[Optional[dict], int]:
     return audio[0], 0
 
 
-async def plan(source: Path, subtitle: Optional[Any] = None) -> MediaPlan:
+async def plan(
+    source: Union[Path, str], subtitle: Optional[Any] = None, index: Optional[Any] = None
+) -> MediaPlan:
     """Probe ``source`` and decide what has to be converted.
 
     ``subtitle`` is an optional :class:`pyatv_cast.subtitles.Subtitle` to offer with it.
+    ``index`` is a :class:`pyatv_cast.mp4index.Mp4Index`; with it the keyframes come from
+    the file's index instead of ffprobe reading every packet, which a slow or partly
+    copied file cannot afford.
     """
     info = await probe(source)
     video = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
@@ -226,12 +247,12 @@ async def plan(source: Path, subtitle: Optional[Any] = None) -> MediaPlan:
         if audio is not None:
             codecs.append("mp4a.40.2")
         result.codecs = ",".join(codecs)
-    keys = await keyframes(source)
+    keys = index.keyframes if index is not None else await keyframes(source)
     result.ts_shift = max(0.0, -keys[0][1]) if keys else 0.0
     result.segments = plan_segments(keys, duration)
     _LOGGER.info(
         "%s: %d segments, video %s, audio %s",
-        source.name, len(result.segments),
+        getattr(source, "name", source), len(result.segments),
         "copy" if result.copy_video else f"transcode from {video['codec_name']}",
         "none" if not audio else "copy" if result.copy_audio else
         f"transcode from {audio['codec_name']}",
@@ -290,8 +311,27 @@ class JitHlsServer:
         self._cache: "OrderedDict[int, bytes]" = OrderedDict()
         self._inflight: dict = {}
         self._slots = asyncio.Semaphore(MAX_FFMPEG)
+        self._running: set = set()  # ffmpeg runs under way
+        self._moved: set = set()  # ones stopped because the source changed
         self._runner: Optional[web.AppRunner] = None
         self.requests = 0  # what the renderer asked for: 0 means it never connected
+        self.reached = 0.0  # start of the last segment asked for: where a stalled player is
+
+    @property
+    def media(self) -> MediaPlan:
+        """What is being served."""
+        return self._media
+
+    def use_source(self, source: Union[Path, str]) -> None:
+        """Cut segments from now on from ``source``, the same video read another way.
+
+        A segment being cut starts over from it too: left reading the old source, the one
+        segment the renderer is waiting for would be the last to arrive.
+        """
+        self._media.source = source
+        self._moved |= self._running
+        for run in self._running:
+            run.cancel()
 
     async def _segment_bytes(self, index: int) -> bytes:
         if index in self._cache:
@@ -308,7 +348,18 @@ class JitHlsServer:
 
     async def _convert(self, index: int) -> bytes:
         async with self._slots:
-            data = await _run(*segment_command(self._media, index))
+            while True:
+                run = asyncio.ensure_future(_run(*segment_command(self._media, index)))
+                self._running.add(run)
+                try:
+                    data = await run
+                    break
+                except asyncio.CancelledError:
+                    if run not in self._moved:
+                        raise
+                finally:
+                    self._running.discard(run)
+                    self._moved.discard(run)
         self._cache[index] = data
         while len(self._cache) > CACHE_SEGMENTS:
             self._cache.popitem(last=False)
@@ -335,6 +386,7 @@ class JitHlsServer:
         index = int(request.match_info["index"])
         if not 0 <= index < len(self._media.segments):
             raise web.HTTPNotFound()
+        self.reached = self._media.segments[index].start
         try:
             data = await self._segment_bytes(index)
         except RuntimeError as ex:

@@ -21,8 +21,13 @@ when something goes wrong. It speaks **DLNA** (preferred, no setup) and **AirPla
 | A file the TV can play | Sent **untouched**: the TV downloads the file itself. |
 | A file the TV cannot play | Converted **just in time** while the TV downloads it. Video and audio the TV already understands are copied, so usually only the audio (or nothing but the container) is re-encoded. No temporary files. |
 | A direct media URL (`.mp4`, `.m3u8`, ...) | Handed to the TV as is when it can fetch it (plain `http://`), otherwise relayed through this computer without re-encoding. |
-| Any other URL (a YouTube page, ...) | Asked of [yt-dlp](https://github.com/yt-dlp/yt-dlp), then relayed and converted only if needed. If a site will not let ffmpeg read the address directly (HTTP 403), yt-dlp downloads the video first, with a progress display. |
+| Any other URL (a YouTube page, a live stream, ...) | Streamed by [yt-dlp](https://github.com/yt-dlp/yt-dlp) itself into a local buffer; playback starts once enough is buffered that it cannot run dry, and the buffer is then re-streamed to the TV (video and audio copied when the TV takes them). ffmpeg never opens the site's address, so sites that refuse it (HTTP 403) work. See [Web videos](#web-videos-and-live-streams). |
 | A web or remote video, over AirPlay | Streamed **live**: ffmpeg writes HLS segments to a temporary folder as it downloads, and playback starts after a few seconds. `--download-first` fetches everything before playing instead. |
+
+Slow files need no options. Each local file is timed against what the video needs, and one
+that cannot comfortably keep up, whether on a network drive or a tired USB disk, plays through a
+local copy instead: playback starts once the rest can no longer run out, and the whole movie
+ends up in the copy. See [Slow files](#slow-files).
 
 It asks the TV what it can play, so "can the TV play this?" is decided from the TV's own
 list of media types plus the video and audio codecs, not guessed from the file name.
@@ -66,7 +71,7 @@ TV has it, because it needs no pairing.
 | `--start SECONDS` | Start position |
 | `--mode {auto,direct,convert}` | `auto` sends untouched when possible, `direct` never converts, `convert` always converts |
 | `--subtitles FILE` / `--no-subtitles` | Use this subtitle file, or send none |
-| `--download-first` | AirPlay with a web or remote video: download all of it (with progress) before playing, for a seek bar and subtitles, instead of streaming it live |
+| `--download-first` | Web videos: download all of it (with progress) before playing, for a seek bar and subtitles, instead of streaming it through the buffer (AirPlay with a plain remote video: instead of streaming it live) |
 | `--ytdlp-format FORMAT` | yt-dlp format selector (default: up to 1080p, H.264 + AAC, so it can be copied) |
 | `--cookies-from-browser BROWSER` | Use a browser's login for sites that need it, e.g. `chrome` |
 | `--no-jit`, `--workdir DIR` | AirPlay/HLS only: convert everything to disk first |
@@ -93,6 +98,24 @@ such as YouTube often answer subtitle requests with "429 Too Many Requests". If 
 come through, the video still plays, with a note saying so. Streaming live does not include
 subtitles; use `--subtitles FILE` or `--download-first`.
 
+## Web videos and live streams
+
+For a page yt-dlp handles, yt-dlp's own downloader (so signed addresses, DASH, HLS and live
+streams all work) writes MPEG-TS into a growing file in a temporary folder. Nothing plays until
+enough is there:
+
+- **Live streams** (no known length): 20 seconds of video, then the TV is kept that far
+  behind. `--start` is not available.
+- **Other videos**: at least 10 seconds, plus whatever the connection is not expected to
+  deliver while the video plays (trusting 80% of the measured speed), so a slow link waits longer.
+
+The buffer is then sent to the TV through ffmpeg, which copies video and audio the TV
+understands. yt-dlp is told to keep the original timestamps (`-copyts`) when it joins the
+separate video and audio streams of a live video: they rarely start at the same moment, and
+without this the audio plays several seconds early. The buffer lives in the temporary folder (`--workdir` to move it) and is removed
+when playback ends; a long live stream uses roughly 0.5 GB an hour at 1080p. There are no
+subtitles and no seeking while streaming; `--download-first` gives both.
+
 ## When something goes wrong
 
 Every failure says what happened and what to try. For example:
@@ -116,13 +139,46 @@ The common ones:
   your network interfaces when there is more than one.
 - **A web page will not play.** Sites change often: update yt-dlp, or add
   `--cookies-from-browser chrome` for sites that need a login.
-- **"ffmpeg cannot read this video straight from the site (403)".** Normal for YouTube and
-  similar sites. The video is downloaded with yt-dlp instead, which needs free disk space
-  (shown before it starts); use `--workdir` to put the temporary files on a bigger disk.
+- **"yt-dlp did not deliver any video" / "could not stream".** The site is slow, blocking
+  yt-dlp or needs a login: update yt-dlp, add `--cookies-from-browser chrome`, or try
+  `--download-first`.
 - **AirPlay says "not paired".** Pair once with
   `atvremote --id <id> --protocol airplay pair` and enter the PIN shown on the TV.
 
 ## How it works
+
+### Slow files
+
+Whether a file needs buffering is measured, not guessed from where it lives. Cold reads at
+four places across the file (past the operating system's cache) give the speed it really
+reads at, and anything under six times what the video needs goes through a local copy. An
+earlier copy of the same path is reused if the file is still exactly the same size, without
+reading the source at all.
+
+- **The copy** fills in blocks: first whatever is being read right now, then onward from
+  the playback position, then whatever was skipped. Seeking simply moves where it fetches,
+  and whatever order the video is watched in, the copy ends up complete. The index (`moov`) is
+  fetched first, wherever it is in the file. After the video ends the rest is fetched too;
+  Ctrl-C leaves it for next time, and an interrupted copy carries on from where it was.
+- **Starting**: playback waits until what is copied, plus what the source will deliver
+  while the video plays, covers the whole video, trusting 80% of the measured speed. The
+  renderer, or ffmpeg when converting, reads the copy through the same address either way.
+- **While playing over DLNA**: the renderer's own position is compared with the copy. If it
+  gets within ten seconds, the renderer is paused while the same sum is redone against the
+  current speed, then resumed. Renderers that report no position are judged by what they last
+  read, and ones that refuse to pause are left to ride it out. AirPlay receivers rebuffer on
+  their own.
+
+A file judged fast enough plays directly, but is still checked every 15 seconds. If it stops
+reading comfortably faster than the video needs, twice in a row, or the renderer's position
+freezes while it says it is playing, playback moves onto a local copy. HLS moves between one
+segment and the next with no interruption. A file sent as is, or a live conversion, ties the
+renderer to the old address, so it is paused, the copy gets ahead of that position, and the
+video is reloaded where it was. A short interruption beats the video dying on the TV.
+
+Copies live in `pyatv-cast-cache-<user>/files` inside the system's temporary folder, which the
+OS clears on its own, so a copy lasts until then. When the disk is short of room the least recently used copies are removed; if there is still no room, the
+video plays directly from the file.
 
 ### DLNA
 
@@ -200,6 +256,9 @@ streaming tests generate a tiny video with ffmpeg and are skipped without it.
   fetched so far, and subtitles are not included (`--download-first` fixes both).
 - No seeking while playing yet (use `--start`), choice between several subtitle or audio
   tracks, burned-in subtitles (they need an ffmpeg built with libass), or DRM.
+- A video with no MP4/MOV index can only be cut into HLS once its keyframes are known, so
+  over HLS such a file is copied in full first (sent as is over DLNA, it starts as usual).
+- Jumping far past what has been copied waits for that part to arrive.
 - A converted video is streamed live, so the TV's own seek bar does not work on it.
 - Video that needs re-encoding uses VideoToolbox on a Mac, else software `libx264`, which
   may not keep up in real time for high-bitrate sources.

@@ -424,3 +424,54 @@ async def test_direct_server_counts_what_the_renderer_asks_for(tmp_path):
         assert server.requests == 1
     finally:
         await server.stop()
+
+
+@pytest.mark.parametrize(
+    "answer,expected",
+    [
+        ({"RelTime": "0:01:02.500"}, 62.5),
+        ({"RelTime": "1:00:00"}, 3600.0),
+        ({"RelTime": "NOT_IMPLEMENTED"}, None),
+        ({}, None),
+    ],
+)
+async def test_position(answer, expected, monkeypatch):
+    player = dlna.DlnaPlayer.__new__(dlna.DlnaPlayer)
+
+    async def action(name):
+        assert name == "GetPositionInfo"
+        return answer
+
+    monkeypatch.setattr(player, "_action", action)
+    assert await player.position() == expected
+
+
+async def test_position_when_the_renderer_refuses(monkeypatch):
+    player = dlna.DlnaPlayer.__new__(dlna.DlnaPlayer)
+
+    async def action(name):
+        raise dlna.DlnaError("not supported")
+
+    monkeypatch.setattr(player, "_action", action)
+    assert await player.position() is None
+
+
+async def test_reloading_does_not_read_as_the_end(monkeypatch):
+    player = dlna.DlnaPlayer.__new__(dlna.DlnaPlayer)
+    player.ended = asyncio.Event()
+    player.flags = player.mime = ""
+    old = asyncio.ensure_future(asyncio.sleep(10))
+    player._poll = old
+
+    async def action(name, **kw):
+        return {}
+
+    async def forever():
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(player, "_action", action)
+    monkeypatch.setattr(player, "_poll_state", forever)
+    await player.play("http://x/a.mp4")
+    await asyncio.sleep(0)
+    assert old.cancelled() and player._poll is not old
+    player._poll.cancel()

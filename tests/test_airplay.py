@@ -281,3 +281,12 @@ async def test_events_reach_the_callback(receiver):
     player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify, on_event=events.append)
     player._event({"name": "playing"})
     assert events == [{"name": "playing"}] and not player.ended.is_set()
+
+
+async def test_a_dropped_item_is_a_failure_not_an_ending(receiver):
+    mock, port = receiver
+    player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify)
+    player._event({"params": {"data": {"reason": "ReasonAdvanceDueToError", "type": "currentItemChanged"}}})
+    assert player.failed and player.ended.is_set()
+    player._event({"params": {"data": {"name": "itemPlayedToEnd"}}})
+    assert player.failed

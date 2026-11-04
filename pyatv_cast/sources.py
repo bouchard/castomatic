@@ -64,6 +64,8 @@ class MediaSource:
     ytdlp_format: str = DEFAULT_YTDLP_FORMAT
     cookies_from_browser: Optional[str] = None
     size_estimate: Optional[int] = None  # bytes, when the site says
+    is_live: bool = False  # a live stream: no end, no known length
+    relay: Any = None  # the ytstream.YtdlpBuffer this is being streamed through, once started
 
     @property
     def is_local(self) -> bool:
@@ -160,7 +162,7 @@ async def from_ytdlp(
         info.get("title") or _title_from_url(url), inputs,
         duration=info.get("duration"), via_ytdlp=True, page_url=url,
         ytdlp_format=ytdlp_format, cookies_from_browser=cookies_from_browser,
-        size_estimate=size or None,
+        size_estimate=size or None, is_live=bool(info.get("is_live")),
     )  # fmt: skip
 
 

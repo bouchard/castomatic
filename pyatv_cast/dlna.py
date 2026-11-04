@@ -11,7 +11,7 @@ import logging
 import mimetypes
 import socket
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from xml.sax.saxutils import escape
 
@@ -282,6 +282,9 @@ class DlnaPlayer:
 
         ``subtitle_url`` points at an SRT file the renderer should show.
         """
+        if self._poll:  # this Stop must not read as the end of the video
+            self._poll.cancel()
+            self._poll = None
         self.ended.clear()
         try:  # a renderer left mid-load by an earlier session answers "transport is locked"
             await self._action("Stop")
@@ -346,6 +349,15 @@ class DlnaPlayer:
     async def state(self) -> str:
         """The renderer's transport state, e.g. PLAYING or TRANSITIONING."""
         return await self._state()
+
+    async def position(self) -> Optional[float]:
+        """Seconds into the video the renderer is showing, or None if it will not say."""
+        try:
+            info = await self._action("GetPositionInfo")
+            hours, minutes, seconds = info.get("RelTime", "").split(":")
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except (DlnaError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None  # some answer NOT_IMPLEMENTED, or an empty time, while stopped
 
     async def _action(
         self,
@@ -440,9 +452,21 @@ class DirectFileServer:
     the ``CaptionInfo.sec`` header (what Samsung renderers ask for).
     """
 
-    def __init__(self, path: Path, address: str, port: int = 0, subtitle: Any = None) -> None:
-        """Initialize a new DirectFileServer."""
+    def __init__(
+        self,
+        path: Path,
+        address: str,
+        port: int = 0,
+        subtitle: Any = None,
+        respond: Optional[Callable[..., Awaitable[web.StreamResponse]]] = None,
+    ) -> None:
+        """Initialize a new DirectFileServer.
+
+        ``respond(request, headers)``, if given, answers instead of reading ``path``: how
+        a file still being copied from a slow drive is served.
+        """
         self._path = path
+        self._respond = respond
         self._address = address
         self._port = port
         self._subtitle = subtitle
@@ -466,6 +490,8 @@ class DirectFileServer:
         }
         if self.subtitle_url:
             headers["CaptionInfo.sec"] = self.subtitle_url
+        if self._respond:
+            return await self._respond(request, headers)
         return web.FileResponse(self._path, headers=headers)
 
     async def _serve_subtitle(self, request: web.Request) -> web.Response:
@@ -479,7 +505,8 @@ class DirectFileServer:
         if self._subtitle is not None:
             self._srt = await self._subtitle.srt()
             app.router.add_get("/subs.srt", self._serve_subtitle)
-        self._runner = web.AppRunner(app, access_log=None)
+        # A request waiting on a slow drive must not hold up stopping
+        self._runner = web.AppRunner(app, access_log=None, shutdown_timeout=1.0)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._address, self._port)
         await site.start()

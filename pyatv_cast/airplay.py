@@ -118,6 +118,7 @@ class AirPlayPlayer:
         self.stream_id: Optional[str] = None
         self.item_uuid: Optional[str] = None
         self.ended = asyncio.Event()
+        self.failed = False  # the receiver gave up on the video rather than finishing it
         self._event_channel: Optional[EventChannel] = None
         self._keepalive: Optional["asyncio.Task[None]"] = None
 
@@ -206,6 +207,7 @@ class AirPlayPlayer:
         """Start playing the HLS playlist at ``url`` and begin playback."""
         self.item_uuid = str(uuid4())
         self.ended.clear()
+        self.failed = False
         await self._command(
             {
                 "type": "insertPlayQueueItem",
@@ -303,7 +305,11 @@ class AirPlayPlayer:
 
     def _event(self, event: Dict[str, Any]) -> None:
         _LOGGER.debug("event: %s", event)
-        if "itemPlayedToEnd" in repr(event):
+        text = repr(event)
+        if "itemPlayedToEnd" in text:
+            self.ended.set()
+        elif "ReasonAdvanceDueToError" in text:  # e.g. a segment came too late: it is gone
+            self.failed = True
             self.ended.set()
         if self._on_event:
             self._on_event(event)

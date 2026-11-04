@@ -1,6 +1,7 @@
 """Just-in-time HLS: segment planning, ffmpeg commands and the HTTP server."""
 
 import asyncio
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -247,3 +248,101 @@ async def test_static_server_serves_directory(tmp_path):
                 assert "Cache-Control" not in resp.headers
     finally:
         await plain.stop()
+
+
+def test_a_jit_server_can_change_what_it_reads():
+    media = hls.MediaPlan("/a.mp4", 10.0, True, True, True, 0)
+    server = hls.JitHlsServer(media, "127.0.0.1")
+    server.use_source("http://127.0.0.1:1/media.mp4")
+    assert media.source == "http://127.0.0.1:1/media.mp4"
+
+
+async def test_a_cancelled_run_stops_its_process(tmp_path):
+    marker = tmp_path / "ran"
+    task = asyncio.ensure_future(
+        hls._run("sh", "-c", f"echo $$ > {marker}; exec sleep 30")  # noqa: SLF001
+    )
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if marker.exists() and marker.read_text().strip():
+            break
+    pid = int(marker.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+    pytest.fail("the process was left running")
+
+
+async def test_changing_source_restarts_the_segment_being_cut(monkeypatch):
+    media = hls.MediaPlan("old", 10.0, True, True, True, 0, segments=[hls.Segment(0.0, 10.0, 10.0)])
+    server = hls.JitHlsServer(media, "127.0.0.1")
+    started = asyncio.Event()
+    reads = []
+
+    async def run(*args):
+        source = args[args.index("-i") + 1]
+        reads.append(source)
+        if source == "old":
+            started.set()
+            await asyncio.sleep(60)
+        return b"from " + source.encode()
+
+    monkeypatch.setattr(hls, "_run", run)
+    waiting = asyncio.ensure_future(server._segment_bytes(0))  # noqa: SLF001
+    await started.wait()
+    server.use_source("new")
+    assert await asyncio.wait_for(waiting, 2) == b"from new"
+    assert reads == ["old", "new"]
+
+
+async def test_stopping_a_segment_is_not_a_restart(monkeypatch):
+    media = hls.MediaPlan("old", 10.0, True, True, True, 0, segments=[hls.Segment(0.0, 10.0, 10.0)])
+    server = hls.JitHlsServer(media, "127.0.0.1")
+    started = asyncio.Event()
+
+    async def run(*args):
+        started.set()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(hls, "_run", run)
+    task = asyncio.ensure_future(server._convert(0))  # noqa: SLF001
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_the_server_knows_which_segment_was_asked_for_last(monkeypatch):
+    segments = [hls.Segment(0.0, 6.0, 6.0), hls.Segment(6.0, 6.0, 6.0)]
+    media = hls.MediaPlan("src", 12.0, True, True, True, 0, segments=segments)
+    server = hls.JitHlsServer(media, "127.0.0.1")
+
+    async def run(*args):
+        return b"ts"
+
+    monkeypatch.setattr(hls, "_run", run)
+    url = await server.start()
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(url.replace("index.m3u8", "seg00001.ts")) as resp:
+                assert resp.status == 200
+    finally:
+        await server.stop()
+    assert server.reached == 6.0
+
+
+def test_a_start_on_a_segment_edge_moves_into_it():
+    segs = [hls.Segment(0.0, 6.0, 6.0), hls.Segment(6.0, 6.0, 6.0), hls.Segment(12.0, 0.4, 0.4)]
+    media = hls.MediaPlan("src", 12.4, True, True, True, 0, segments=segs)
+    assert media.playable_start(0.0) == 0.0
+    assert media.playable_start(6.0) == 6.5 and media.playable_start(5.8) == 6.5
+    assert media.playable_start(9.0) == 9.0
+    assert media.playable_start(12.0) == 12.2
+    server = hls.JitHlsServer(media, "127.0.0.1")
+    assert server.media is media
