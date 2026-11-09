@@ -74,10 +74,14 @@ class YtdlpBuffer:
         self._tasks: List["asyncio.Task[Any]"] = []
         self._stderr = b""
 
+    def command(self) -> List[str]:
+        """What writes the video, as MPEG-TS, to stdout."""
+        return ytdlp_command(self.source)
+
     async def start(self) -> None:
         """Start yt-dlp."""
-        cmd = ytdlp_command(self.source)
-        _LOGGER.debug("yt-dlp: %s", cmd)
+        cmd = self.command()
+        _LOGGER.debug("buffering with: %s", cmd)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_bytes(b"")
         # Its own process group, so ffmpeg children go with it when we stop
@@ -188,6 +192,37 @@ class YtdlpBuffer:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
         self.finished.set()
+
+
+def remote_command(source: MediaSource) -> List[str]:
+    """ffmpeg copying a remote media address into MPEG-TS on stdout, reconnecting as needed."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
+    ]  # fmt: skip
+    for item in source.inputs:
+        cmd += [*stream._header_args(item.headers), "-i", item.location]  # noqa: SLF001
+    cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]
+    return cmd + ["-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1"]
+
+
+class RemoteBuffer(YtdlpBuffer):
+    """A media address read too slowly to play live, buffered here the same way.
+
+    ffmpeg copies the streams (no conversion) into the buffer, and playback starts once
+    what is buffered plus what keeps arriving covers the whole video: a wait up front
+    instead of the TV stalling part way.
+    """
+
+    def command(self) -> List[str]:
+        """ffmpeg reading the address, not yt-dlp."""
+        return remote_command(self.source)
+
+    def _failure(self) -> UserError:
+        return UserError(
+            f"could not keep downloading {self.source.title!r}: {self.error or 'nothing arrived'}",
+            "Check that the address still works in a browser, then try again.",
+        )
 
 
 class BufferServer:

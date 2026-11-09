@@ -210,11 +210,14 @@ class StreamPlan:
     summary: Summary
     copy_video: bool
     copy_audio: bool
+    burn: Optional[Path] = None  # an SRT file drawn onto the picture (forces re-encoding)
 
     @property
     def description(self) -> str:
         """What will happen, in words."""
         video = "copying video" if self.copy_video else "converting video to H.264"
+        if self.burn is not None:
+            video = "converting video to H.264 with the subtitles drawn on"
         if not self.summary.audio_codec:
             return video
         audio = "copying audio" if self.copy_audio else "converting audio to AAC"
@@ -272,7 +275,9 @@ def _base_command(plan: StreamPlan, start: float) -> List[str]:
     cmd += ["-map", f"{summary.video_input}:v:0"]
     if summary.audio_input is not None:
         cmd += ["-map", f"{summary.audio_input}:a:{summary.audio_index}"]
-    if plan.copy_video:
+    if plan.burn is not None:
+        cmd += ["-vf", f"subtitles=filename={_filter_escape(str(plan.burn))}"]
+    if plan.copy_video and plan.burn is None:
         cmd += ["-c:v", "copy"]
         if summary.video_codec in ("h264", "hevc"):
             cmd += ["-bsf:v", f"{summary.video_codec}_mp4toannexb"]
@@ -286,6 +291,39 @@ def _base_command(plan: StreamPlan, start: float) -> List[str]:
         else:
             cmd += ["-c:a", "aac", "-b:a", "256k", "-ac", "2"]
     return cmd
+
+
+def _filter_escape(text: str) -> str:
+    """Escape a value for an ffmpeg filter option, as ffmpeg's filtergraph docs describe.
+
+    Two levels: first the option value (``\\``, ``'`` and ``:`` are special there), then the
+    filtergraph around it (``\\``, ``'``, ``[``, ``]``, ``,`` and ``;``).
+    """
+    for char in "\\':":
+        text = text.replace(char, "\\" + char)
+    for char in "\\'[],;":
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+@functools.lru_cache(maxsize=1)
+def can_burn_subtitles() -> bool:
+    """Whether this ffmpeg has the ``subtitles`` filter (it needs ffmpeg built with libass)."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(line.split()[1:2] == ["subtitles"] for line in out.splitlines() if line.strip())
+
+
+BURN_HINT = (
+    "This ffmpeg was built without libass, which drawing subtitles needs. On a Mac: "
+    "`brew uninstall ffmpeg && brew tap homebrew-ffmpeg/ffmpeg && brew install "
+    "homebrew-ffmpeg/ffmpeg/ffmpeg`, or any ffmpeg build that lists `subtitles` in "
+    "`ffmpeg -filters`."
+)
 
 
 def stream_command(plan: StreamPlan, start: float = 0.0) -> List[str]:

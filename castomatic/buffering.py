@@ -57,6 +57,53 @@ Status = Callable[[int, int, Optional[float]], None]  # (have bytes, needed byte
 
 # -- is this file slow? ------------------------------------------------------------------
 
+NETWORK_FILESYSTEMS = {
+    "smbfs", "cifs", "smb3", "nfs", "nfs4", "afpfs", "webdav", "davfs", "fuse.sshfs",
+    "sshfs", "osxfuse", "macfuse", "fuse.rclone", "9p", "ncpfs",
+}  # fmt: skip
+# A network share's speed changes with everything else on the network, so one measured
+# as fast enough is still held to a higher standard before it is trusted to play directly
+NETWORK_FACTOR = 2.0
+
+
+def _mount_table() -> List[tuple]:
+    """(mount point, filesystem type) for every mounted filesystem."""
+    try:
+        with open("/proc/mounts", encoding="utf-8") as mounts:  # Linux
+            return [(f[1], f[2]) for f in (line.split() for line in mounts) if len(f) > 2]
+    except OSError:
+        pass
+    try:
+        import subprocess
+
+        out = subprocess.run(["mount"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    table = []
+    for line in out.splitlines():  # "//u@nas/share on /Volumes/share (smbfs, nodev, ...)"
+        if " on " in line and " (" in line:
+            rest = line.split(" on ", 1)[1]
+            point, _, kind = rest.rpartition(" (")
+            table.append((point, kind.split(",")[0].strip(")").strip()))
+    return table
+
+
+def filesystem_type(path: Path) -> Optional[str]:
+    """The type of filesystem ``path`` is on (``apfs``, ``smbfs``, ``nfs`` ...), if known."""
+    target = str(path.resolve())
+    best = None
+    for point, kind in _mount_table():
+        inside = target == point or target.startswith(point.rstrip("/") + "/")
+        if inside and (best is None or len(point) > len(best[0])):
+            best = (point, kind)
+    return best[1] if best else None
+
+
+def is_network_path(path: Path) -> bool:
+    """Whether ``path`` is on a network share."""
+    kind = (filesystem_type(path) or "").lower()
+    return kind in NETWORK_FILESYSTEMS or kind.startswith("fuse.") and "ssh" in kind
+
 
 def _skip_os_cache(fd: int) -> None:
     """Ask for real reads: what the OS remembers says nothing about the drive."""
@@ -438,11 +485,17 @@ async def choose(
     else:
         rate = await measure_rate(path)
         bitrate = size / duration
-        if rate is None or rate >= FAST_FACTOR * bitrate:
+        network = is_network_path(path)
+        factor = FAST_FACTOR * (NETWORK_FACTOR if network else 1.0)
+        if rate is None or rate >= factor * bitrate:
+            if network and rate is not None:
+                _LOGGER.info("network share reads at %.1f MB/s: fast enough to play directly", rate / 1e6)
             return None
+        where = "this file is on a network share and" if network else "this file"
         note(
-            f"this file reads at {rate / 1e6:.1f} MB/s and the video needs "
-            f"{bitrate / 1e6:.1f} MB/s: buffering through a local copy."
+            f"{where} reads at {rate / 1e6:.1f} MB/s and the video needs "
+            f"{bitrate / 1e6:.1f} MB/s: buffering through a local copy, so playback "
+            "may take a moment to start but will not stop part way."
         )
     return await _open_copy(path, root, workers, on_note)
 

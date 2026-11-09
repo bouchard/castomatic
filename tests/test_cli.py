@@ -521,9 +521,9 @@ def run_env(monkeypatch):
             raise env.probe_error
         return {"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}], "format": {"duration": "100"}}
 
-    async def find_target(spec, protocol, choose, credentials):
+    async def find_targets(spec, protocol, choose, credentials):
         env.asked = (spec, protocol, choose, credentials)
-        return env.target
+        return [env.target]
 
     async def play_dlna(args, source, summ, target, workdir, buffered=None, fallback=None):
         env.played.append(("dlna", workdir))
@@ -552,7 +552,7 @@ def run_env(monkeypatch):
     monkeypatch.setattr(cli, "_download_first", download_first)
     monkeypatch.setattr(cli.sources, "resolve", resolve)
     monkeypatch.setattr(cli.stream, "probe_input", probe)
-    monkeypatch.setattr(cli.targets, "resolve_target", find_target)
+    monkeypatch.setattr(cli.targets, "resolve_targets", find_targets)
     monkeypatch.setattr(cli, "_play_dlna", play_dlna)
     monkeypatch.setattr(cli, "_play_airplay", play_airplay)
     return env

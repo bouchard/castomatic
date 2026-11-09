@@ -1,6 +1,6 @@
 [project]
 name = "castomatic"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cast anything anywhere: play a file, URL or web video on any TV over Chromecast, DLNA, Roku or AirPlay 2, converting only when needed"
 readme = "README.md"
 license = "MIT"

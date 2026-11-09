@@ -66,6 +66,7 @@ class MediaSource:
     size_estimate: Optional[int] = None  # bytes, when the site says
     is_live: bool = False  # a live stream: no end, no known length
     relay: Any = None  # the ytstream.YtdlpBuffer this is being streamed through, once started
+    via_castor: bool = False  # castor found this stream on the page (yt-dlp could not)
 
     @property
     def is_local(self) -> bool:
@@ -185,7 +186,18 @@ async def resolve(
     if urlparse(text).scheme in ("http", "https"):
         if await is_direct_media(text):
             return MediaSource(_title_from_url(text), [Input(text)])
-        return await from_ytdlp(text, ytdlp_format, cookies_from_browser, verbose)
+        try:
+            return await from_ytdlp(text, ytdlp_format, cookies_from_browser, verbose)
+        except UserError as ex:
+            found = await from_castor(text)
+            if found is not None:
+                return found
+            from castomatic.engines import castor
+
+            extra = "castor was tried too and found no video." if castor.find() else (
+                "castor can find videos on pages yt-dlp cannot read. " + castor.INSTALL_HINT
+            )
+            raise UserError(ex.message, f"{ex.hint}\n{extra}" if ex.hint else extra) from ex
     if urlparse(text).scheme:
         raise UserError(
             f"{text}: only http:// and https:// addresses are supported.",
@@ -202,6 +214,49 @@ async def resolve(
 
 # (bytes so far, total bytes if known, bytes per second if known)
 ProgressFunc = Callable[[int, Optional[int], Optional[float]], None]
+
+
+async def measure_url_rate(item: Input, seconds: float = 2.5, limit: int = 64 * 1024 * 1024) -> Optional[float]:
+    """Bytes per second ``item`` downloads at, timed over ``seconds`` (None if it cannot tell).
+
+    Starts a quarter of the way in when the server allows it, so a fast first burst
+    (a CDN's cached head) does not flatter it.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        async with aiohttp.ClientSession(headers=item.headers) as http:
+            async with http.get(
+                item.location, timeout=aiohttp.ClientTimeout(total=seconds + 10)
+            ) as resp:
+                if resp.status >= 400:
+                    return None
+                began = loop.time()
+                got = 0
+                async for chunk in resp.content.iter_chunked(65536):
+                    got += len(chunk)
+                    elapsed = loop.time() - began
+                    if elapsed >= seconds or got >= limit:
+                        return got / max(elapsed, 1e-6)
+                elapsed = loop.time() - began
+                return got / max(elapsed, 1e-6) if got else None
+    except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError) as ex:
+        _LOGGER.debug("could not time %s: %s", item.location, ex)
+        return None
+
+
+async def from_castor(url: str) -> Optional[MediaSource]:
+    """Ask castor (if installed) for the video on a page yt-dlp could not read."""
+    from castomatic.engines import castor
+
+    if castor.find() is None:
+        return None
+    print("yt-dlp could not read this page; asking castor to look for the video ...")
+    streams = await castor.resolve_page(url)
+    if not streams:
+        return None
+    best = streams[0]
+    _LOGGER.info("castor found %d stream(s); using %s", len(streams), best.url)
+    return MediaSource(_title_from_url(url), [Input(best.url)], page_url=url, via_castor=True)
 
 
 def format_size(num: float) -> str:

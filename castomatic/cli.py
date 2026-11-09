@@ -2,7 +2,9 @@
 
 With no other options it finds the TV (asking once if there are several, then
 remembering), sends the file untouched if the TV can play it, converts just in time if not,
-and asks yt-dlp for the video when given a web page.
+and asks yt-dlp for the video when given a web page. A TV reachable in several ways
+(Chromecast, DLNA, Roku, AirPlay) is tried the most reliable way first, and the next way
+if that one does not start playing.
 """
 
 import argparse
@@ -14,15 +16,21 @@ import time
 import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional
 
 import aiohttp
 from pyatv import exceptions as pyatv_exceptions
 
-from castomatic import buffering, config, dlna, hls, sources, stream, subtitles, targets, ytstream
+from castomatic import (
+    banner, buffering, config, dlna, hls, planner, sources, stream, subtitles, targets, ytstream,
+)  # fmt: skip
 from castomatic.errors import UPNP_HINTS, UserError
 from castomatic.airplay import AirPlayError, AirPlayPlayer
+from castomatic.backends.base import SUBS_NONE, SUBS_WEBVTT, CastError, Capabilities
+from castomatic.backends.chromecast import ChromecastPlayer
+from castomatic.backends.roku import RokuPlayer
 from castomatic.live import LiveHls
+from castomatic.planner import Delivery, choose_delivery  # noqa: F401  (part of this module's API)
 
 HLS_MIME = "application/vnd.apple.mpegurl"
 # pyatv has no common base class for its errors; these are the ones a connection can raise
@@ -47,60 +55,39 @@ WATCH_INTERVAL = 2.0
 EXAMPLES = """\
 examples:
   castomatic movie.mkv                     play a file on your TV
-  castomatic https://youtu.be/VIDEO        any page yt-dlp understands
+  castomatic https://youtu.be/VIDEO        any page yt-dlp (or castor) understands
+  castomatic https://host/video.mp4        a video address
   castomatic movie.mkv --start 600         begin 10 minutes in
   castomatic --list                        show the TVs on the network
   castomatic movie.mkv --choose            pick a different TV
+
+commands:
+  castomatic doctor                        check everything, and say what to fix
+  castomatic explain movie.mkv             show what would happen, without playing
 """
 
 
-@dataclass
-class Delivery:
-    """How the source will reach the TV."""
+class StartFailed(Exception):
+    """Playback did not get going this way; another way may work.
 
-    kind: str  # "file", "url", "hls", "static", "stream"
-    reasons: List[str]  # why conversion is needed, if it is
+    Only raised when there is another way left to try (``args.failover``); otherwise the
+    same situation is reported as advice and playback is left to the TV.
+    """
 
+    def __init__(self, reason: str, hint: str = "", fetched: bool = False, untouched: bool = False) -> None:
+        """Initialize a new StartFailed."""
+        super().__init__(reason)
+        self.reason = reason
+        self.hint = hint
+        self.fetched = fetched  # the TV did ask this computer for the video
+        self.untouched = untouched  # the video was being sent as it is
 
-def choose_delivery(
-    mode: str,
-    source: sources.MediaSource,
-    summary: stream.Summary,
-    sink: set,
-    supports_hls: bool,
-) -> Delivery:
-    """Pick the least invasive way to get ``source`` to a DLNA renderer."""
-    reasons = stream.conversion_reasons(summary, source.location, sink)
-    if source.relay is not None:
-        # yt-dlp's MPEG-TS, buffered here: sent as it is when the TV takes its codecs,
-        # otherwise converted by ffmpeg reading our buffer (never the site)
-        reasons = [r for r in reasons if not r.startswith("the TV does not list")]
-        if mode == "convert":
-            reasons = reasons or ["--mode convert"]
-        # Always through ffmpeg (copying whatever the TV takes): yt-dlp's raw MPEG-TS played
-        # with audio and video noticeably out of sync on a TV in testing, a clean remux does not.
-        # It also lets ffmpeg skip ahead for --start, which the buffer cannot.
-        return Delivery("stream", reasons)
-    if source.via_ytdlp or len(source.inputs) > 1:
-        # Resolved addresses are signed, need headers or come as separate video and audio
-        return Delivery("stream", [])
-    if source.is_hls_playlist:
-        if supports_hls:
-            return Delivery("static" if source.is_local else "url", [])
-        return Delivery("stream", ["the TV does not play HLS playlists"])
-    if mode == "convert":
-        return Delivery("hls" if source.is_local and supports_hls else "stream", ["--mode convert"])
-    if source.is_local:
-        if mode == "direct" or not reasons:
-            return Delivery("file", [])
-        return Delivery("hls" if supports_hls else "stream", reasons)
-    secure = source.location.startswith("https://")
-    if mode == "direct" or (not reasons and not secure):
-        return Delivery("url", [])
-    return Delivery("stream", reasons or ["the TV cannot fetch https:// addresses itself"])
+    def as_user_error(self) -> UserError:
+        """For when nothing is left to try."""
+        return UserError(self.reason, self.hint or None)
 
 
-def explain_dlna_error(ex: dlna.DlnaError, tv_name: str) -> UserError:
+def explain_dlna_error(ex: CastError, tv_name: str) -> UserError:
     """Turn a renderer error into advice."""
     hint = UPNP_HINTS.get(ex.code or 0)
     if hint is None:
@@ -165,34 +152,53 @@ async def _ticker(started: float, duration: Optional[float]) -> None:
         await asyncio.sleep(1)
 
 
-async def _watch_start(player: dlna.DlnaPlayer, server: Any, tv_name: str) -> None:
-    """If the TV has not started playing after a while, say why that usually is."""
+FIREWALL_HINT = (
+    "a firewall on this computer is the usual cause (on a Mac: System Settings > Network > "
+    "Firewall, allow incoming connections for Python), or the TV is showing an 'allow' "
+    "prompt for you to accept."
+)
+
+
+async def _watch_start(
+    player: Any, server: Any, tv_name: str, failover: bool = False
+) -> Optional[StartFailed]:
+    """If the TV has not started playing after a while, say why that usually is.
+
+    With ``failover``, nothing is printed: the reason is returned so the caller can try
+    another way instead.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + START_WATCH_SECONDS
     while loop.time() < deadline:
         await asyncio.sleep(WATCH_INTERVAL)
         try:
             if await player.state() in ("PLAYING", "PAUSED_PLAYBACK"):
-                return
-        except (dlna.DlnaError, aiohttp.ClientError, asyncio.TimeoutError):
+                return None
+        except (CastError, aiohttp.ClientError, asyncio.TimeoutError):
             continue
     hits = getattr(server, "requests", None)
-    print()
     if hits is None:
-        print(f"warning: {tv_name} has not started playing yet.\n  hint: if the TV shows an 'allow' prompt, accept it with the remote.")
+        failed = StartFailed(
+            f"{tv_name} has not started playing yet.",
+            "if the TV shows an 'allow' prompt, accept it with the remote.",
+        )
     elif hits == 0:
-        print(
-            f"warning: {tv_name} accepted the command but never asked this computer for the "
-            "video.\n  hint: a firewall on this Mac is the usual cause (System Settings > "
-            "Network > Firewall: allow incoming connections for Python), or the TV is "
-            "showing an 'allow' prompt for you to accept."
+        failed = StartFailed(
+            f"{tv_name} accepted the command but never asked this computer for the video.",
+            FIREWALL_HINT,
         )
     else:
-        print(
-            f"warning: {tv_name} fetched the video but has not started playing it.\n"
-            "  hint: it may not support this format. Try `--mode convert`. If the TV shows an "
-            "'allow' prompt, accept it with the remote."
+        failed = StartFailed(
+            f"{tv_name} fetched the video but has not started playing it.",
+            "it may not support this format. Try `--mode convert`. If the TV shows an "
+            "'allow' prompt, accept it with the remote.",
+            fetched=True,
         )
+    if failover:
+        return failed
+    print()
+    print(f"warning: {failed.reason}\n  hint: {failed.hint}")
+    return None
 
 
 def _check_start(args: argparse.Namespace, duration: Optional[float]) -> None:
@@ -214,21 +220,91 @@ async def _play_dlna(
     buffered: Optional[buffering.BufferedMedia] = None,
     fallback: Optional[buffering.Fallback] = None,
 ) -> None:
+    player = dlna.DlnaPlayer(target.tv.renderer)
+    await _play_renderer(args, source, summary, target, workdir, buffered, fallback, player)
+
+
+async def _play_chromecast(
+    args: argparse.Namespace,
+    source: sources.MediaSource,
+    summary: stream.Summary,
+    target: targets.Target,
+    workdir: Optional[Path],
+    buffered: Optional[buffering.BufferedMedia] = None,
+    fallback: Optional[buffering.Fallback] = None,
+) -> None:
+    player = ChromecastPlayer(target.tv.chromecast)
+    await _play_renderer(args, source, summary, target, workdir, buffered, fallback, player)
+
+
+async def _play_roku(
+    args: argparse.Namespace,
+    source: sources.MediaSource,
+    summary: stream.Summary,
+    target: targets.Target,
+    workdir: Optional[Path],
+    buffered: Optional[buffering.BufferedMedia] = None,
+    fallback: Optional[buffering.Fallback] = None,
+) -> None:
+    player = RokuPlayer(target.tv.roku)
+    await _play_renderer(
+        args, source, summary, target, workdir, buffered, fallback, player, seeks=False
+    )
+
+
+async def _capabilities(player: Any) -> Capabilities:
+    """What the TV plays: asked of the player, or (older players) built from its sink."""
+    if hasattr(player, "capabilities"):
+        return await player.capabilities()
+    sink = await player.sink_types()
+    return planner.dlna_capabilities(sink, any("mpegurl" in m for m in sink))
+
+
+async def _play_renderer(
+    args: argparse.Namespace,
+    source: sources.MediaSource,
+    summary: stream.Summary,
+    target: targets.Target,
+    workdir: Optional[Path],
+    buffered: Optional[buffering.BufferedMedia],
+    fallback: Optional[buffering.Fallback],
+    player: Any,
+    seeks: bool = True,
+) -> None:
+    """Play on a TV that fetches the video from us over HTTP (DLNA, Chromecast, Roku)."""
     tv = target.tv
-    player = dlna.DlnaPlayer(tv.renderer)
+    failover = getattr(args, "failover", False)
     try:
         await player.connect()
-    except OSError as ex:
-        raise UserError(
-            f"cannot reach {tv.name} at {tv.host}: {ex.strerror or ex}.",
-            "Is the TV on, and on the same network as this computer?",
-        ) from ex
+    except (OSError, CastError) as ex:
+        reason = f"cannot reach {tv.name} at {tv.host}: {getattr(ex, 'strerror', None) or ex}."
+        hint = "Is the TV on, and on the same network as this computer?"
+        if failover:
+            raise StartFailed(reason, hint) from ex
+        raise UserError(reason, hint) from ex
     server: Any = None
+    delivery: Optional[Delivery] = None
     try:
-        sink = await player.sink_types()
-        supports_hls = any("mpegurl" in m for m in sink)
-        delivery = choose_delivery(args.mode, source, summary, sink, supports_hls)
+        caps = await _capabilities(player)
+        sink = set(caps.sink)
+        _LOGGER.info("%s plays: %s", tv.name, caps.describe())
+        delivery = choose_delivery(
+            args.mode, source, summary, sink, caps.hls, caps, args.start, seeks
+        )
         sub = await _subtitle_for(args, source, buffered)
+        burn: Optional[Path] = None
+        if sub and getattr(args, "burn_subtitles", False):
+            burn = await _burn_file(sub, args.start, workdir)
+            if burn is not None:
+                live = "live" if caps.live == planner.LIVE_HLS else "stream"
+                delivery = Delivery(live, delivery.reasons + ["drawing the subtitles onto the picture"])
+            sub = None
+        if sub and caps.subtitles == SUBS_NONE:
+            print(f"note: {planner.subtitle_note(caps, True)}")
+            sub = None
+        if sub and delivery.kind == "live":
+            print("note: subtitles are not sent while converting live; they are left out.")
+            sub = None
         duration = summary.duration or source.duration
 
         async def start_playing(at: float) -> float:
@@ -239,22 +315,34 @@ async def _play_dlna(
                 reading = replace(source, inputs=[sources.Input(buffered.url)])
             now = argparse.Namespace(**{**vars(args), "start": at})
             url, server, mime, start = await _prepare_dlna(
-                now, reading, summary, delivery, sink, sub, player, workdir, buffered
+                now, reading, summary, delivery, sink, sub, player, workdir, buffered, caps, burn
             )
             if buffered:  # a renderer asked to start part way plays the opening first
                 await _buffer_gate(buffered, at, duration, opening=start > 0)
             player.mime = mime
             _announce(delivery, server)
-            await player.play(
-                url, title=source.title, start=start,
-                subtitle_url=getattr(server, "subtitle_url", None),
-            )  # fmt: skip
+            try:
+                await player.play(
+                    url, title=source.title, start=start,
+                    subtitle_url=getattr(server, "subtitle_url", None),
+                )  # fmt: skip
+            except CastError as ex:
+                if failover:
+                    advice = explain_dlna_error(ex, tv.name)
+                    raise StartFailed(advice.message, advice.hint or "", untouched=delivery.untouched) from ex
+                raise
             print(f"Playing on {tv.name}. Press Ctrl-C to stop.")
             return at - start
 
         shift = await start_playing(args.start)
         watch = None if buffered else fallback
-        reached = await _wait(player, server, tv.name, source, summary, args, buffered, shift, watch)
+        try:
+            reached = await _wait(
+                player, server, tv.name, source, summary, args, buffered, shift, watch
+            )
+        except StartFailed as ex:
+            ex.untouched = delivery.untouched
+            raise
         if reached is not None:
             buffered = fallback.media
             if delivery.kind == "hls":  # the same segments, from the next one on
@@ -267,7 +355,7 @@ async def _play_dlna(
             await _wait(player, server, tv.name, source, summary, args, buffered, shift)
     except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
         raise _lost_contact(tv.name, ex) from ex
-    except dlna.DlnaError as ex:
+    except CastError as ex:
         raise explain_dlna_error(ex, tv.name) from ex
     finally:
         await player.stop()
@@ -278,17 +366,21 @@ async def _play_dlna(
             print(f"\nffmpeg reported: {server.last_error}")
 
 
-async def _prepare_dlna(args, source, summary, delivery, sink, sub, player, workdir, buffered=None):
+async def _prepare_dlna(
+    args, source, summary, delivery, sink, sub, player, workdir, buffered=None, caps=None, burn=None
+):
     """Start whatever serves the media, returning (url, server, mime, start for the TV)."""
     ip = player.local_ip
     kind = delivery.kind
+    sub_format = "webvtt" if caps is not None and caps.subtitles == SUBS_WEBVTT else "srt"
     if kind == "url":
         return source.location, None, stream.matching_mime(source.location, sink), args.start
     if kind == "file":
-        sub = await _check_subtitle(sub, "srt")
+        sub = await _check_subtitle(sub, sub_format)
         server = dlna.DirectFileServer(
-            source.path, ip, subtitle=sub, respond=buffered.respond if buffered else None
-        )
+            source.path, ip, subtitle=sub, respond=buffered.respond if buffered else None,
+            subtitle_format=sub_format,
+        )  # fmt: skip
         mime = stream.matching_mime(source.location, sink)
         return await server.start(), server, mime, args.start
     if kind == "static":
@@ -299,13 +391,74 @@ async def _prepare_dlna(args, source, summary, delivery, sink, sub, player, work
         media = await (buffered.plan(sub, _print_progress) if buffered else hls.plan(source.path, sub))
         url, server = await _hls_server(args, media, ip, workdir)
         return url, server, HLS_MIME, media.playable_start(args.start)
+    if kind == "live":  # HLS written as ffmpeg goes: what Chromecast and Roku play best
+        plan = stream.make_plan(
+            source.inputs, summary, force_convert=args.mode == "convert",
+            video_ok=set(caps.live_video) if caps else None,
+            audio_ok=set(caps.live_audio) if caps else None,
+        )  # fmt: skip
+        plan.burn = burn
+        server = _LiveServer(LiveHls(plan, workdir / "live", start=args.start), ip)
+        server.description = plan.description
+        return await server.start(), server, HLS_MIME, 0.0  # ffmpeg already skipped ahead
     plan = stream.make_plan(source.inputs, summary, force_convert=args.mode == "convert")
+    plan.burn = burn
     sub = await _check_subtitle(sub, "srt", args.start)
     server = stream.StreamServer(plan, ip, start=args.start, subtitle=sub)
     server.description = plan.description  # shown by _announce
     server.mime = next((m for m in stream.TS_MIMES if m in sink), stream.TS_MIMES[0])
     player.flags = stream.STREAM_FLAGS
     return await server.start(), server, server.mime, 0.0  # ffmpeg already skipped ahead
+
+
+class _LiveServer:
+    """A live HLS conversion and the server for it, started and stopped as one."""
+
+    def __init__(self, live: LiveHls, address: str) -> None:
+        """Initialize a new _LiveServer."""
+        self.live = live
+        self._address = address
+        self._server: Optional[hls.StaticHlsServer] = None
+        self.description = ""
+
+    @property
+    def requests(self) -> Optional[int]:
+        """What the TV asked for (None before it started)."""
+        return self._server.requests if self._server else None
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """Why ffmpeg stopped, if it failed."""
+        return self.live.error if self.live.failed.is_set() else None
+
+    async def start(self) -> str:
+        """Start ffmpeg, wait for the first segments, then serve them."""
+        print("Preparing the video; playback starts in a moment ...")
+        self._server = hls.StaticHlsServer(await self.live.start(), self._address)
+        return await self._server.start()
+
+    async def stop(self) -> None:
+        """Stop serving and stop ffmpeg."""
+        if self._server:
+            await self._server.stop()
+        await self.live.stop()
+
+
+async def _burn_file(sub: Any, start: float, workdir: Optional[Path]) -> Optional[Path]:
+    """Write the subtitle as SRT, timed for a conversion starting at ``start``, to burn in."""
+    if workdir is None:  # run() makes one whenever --burn-subtitles is given
+        return None
+    if not stream.can_burn_subtitles():
+        print(f"warning: subtitles cannot be drawn onto the picture, so they are left out.\n  hint: {stream.BURN_HINT}")
+        return None
+    try:
+        data = await sub.srt(start)
+    except RuntimeError as ex:
+        print(f"warning: subtitles skipped, could not convert them: {ex}")
+        return None
+    path = workdir / "burn.srt"
+    path.write_bytes(data)
+    return path
 
 
 async def _hls_server(args, media, ip, workdir):
@@ -326,6 +479,10 @@ def _announce(delivery: Delivery, server: Any) -> None:
         print("Serving the HLS playlist as is.")
     elif delivery.kind == "hls":
         print(f"Converting to HLS as the TV asks ({why}).")
+    elif delivery.kind == "live":
+        what = getattr(server, "description", "")
+        suffix = f" ({why})" if why else ""
+        print(f"Converting live to HLS{suffix}: {what}.")
     else:
         what = getattr(server, "description", "")
         suffix = f" ({why})" if why else ""
@@ -364,7 +521,7 @@ async def _hold(player) -> bool:
             return False
         await player.pause()
         return True
-    except (dlna.DlnaError, aiohttp.ClientError, asyncio.TimeoutError) as ex:
+    except (CastError, aiohttp.ClientError, asyncio.TimeoutError) as ex:
         _LOGGER.debug("renderer would not pause: %s", ex)
         return False
 
@@ -372,7 +529,7 @@ async def _hold(player) -> bool:
 async def _release(player) -> None:
     try:
         await player.resume()
-    except (dlna.DlnaError, aiohttp.ClientError, asyncio.TimeoutError) as ex:
+    except (CastError, aiohttp.ClientError, asyncio.TimeoutError) as ex:
         _LOGGER.debug("renderer would not resume: %s", ex)
 
 
@@ -388,7 +545,7 @@ async def _watch_direct(player, fallback, start: float, shift: float) -> Optiona
         """Whether a renderer that says it is playing has stopped getting anywhere."""
         try:
             state = await player.state()
-        except (dlna.DlnaError, aiohttp.ClientError, asyncio.TimeoutError):
+        except (CastError, aiohttp.ClientError, asyncio.TimeoutError):
             return False
         seconds = await player.position()
         last, reached["last"] = reached["last"], seconds
@@ -423,9 +580,14 @@ async def _wait(
 ) -> Optional[float]:
     """Wait for the end. With ``watch``, returns the time reached if a switch is needed."""
     duration = summary.duration or source.duration
+    failover = getattr(args, "failover", False)
     ticker = asyncio.ensure_future(_ticker(time.monotonic(), duration))
-    watcher = asyncio.ensure_future(_watch_start(player, server, tv_name))
+    watcher = asyncio.ensure_future(_watch_start(player, server, tv_name, failover))
     try:
+        if failover:
+            failed = await _first_verdict(player, watcher, tv_name)
+            if failed:
+                raise failed
         if buffered:  # holding for the drive can take as long as it takes
             await _keep_fed(player, buffered, duration, shift)
             return None
@@ -440,6 +602,19 @@ async def _wait(
         watcher.cancel()
         print()
     return None
+
+
+async def _first_verdict(player: Any, watcher: "asyncio.Future[Any]", tv_name: str) -> Optional[StartFailed]:
+    """Wait until playback has either got going or clearly failed to."""
+    ended = asyncio.ensure_future(player.wait_until_ended())
+    try:
+        await asyncio.wait({watcher, ended}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        ended.cancel()
+    error = getattr(player, "error", None)
+    if not watcher.done() and error:  # the TV gave up without playing
+        return StartFailed(f"{tv_name} could not play it: {error}.", fetched=True)
+    return watcher.result() if watcher.done() else None
 
 
 async def _swap_when_slow(fallback: buffering.Fallback, server: Any) -> None:
@@ -471,6 +646,8 @@ async def _play_airplay(
         except AirPlayError:
             raise
         except (*PYATV_ERRORS, OSError, asyncio.TimeoutError) as ex:
+            if getattr(args, "failover", False):
+                raise StartFailed(f"could not connect to {tv.name} over AirPlay: {ex}") from ex
             raise UserError(
                 f"could not connect to {tv.name} over AirPlay: {ex}",
                 "The TV's AirPlay port changes between sessions, so try again. If it keeps "
@@ -614,12 +791,14 @@ async def _start_relay(args: argparse.Namespace, source: sources.MediaSource, di
     Returns the source as the program will now read it (our own buffer, never the site),
     what is in it, and the two things to stop afterwards.
     """
-    buffer = ytstream.YtdlpBuffer(source, directory)
+    kind = ytstream.YtdlpBuffer if source.via_ytdlp else ytstream.RemoteBuffer
+    buffer = kind(source, directory)
     feed = ytstream.BufferServer(buffer, "127.0.0.1")
     await buffer.start()
     try:
         what = "live stream" if source.is_live else "video"
-        print(f"Buffering the {what} with yt-dlp before playing ...")
+        tool = " with yt-dlp" if source.via_ytdlp else ""
+        print(f"Buffering the {what}{tool} before playing ...")
         await buffer.wait_ready(args.start, _relay_status)
         print("\r  Buffered enough to play without stopping; the rest keeps arriving." + " " * 20)
         info = await stream.probe_input(sources.Input(str(buffer.path)))
@@ -710,6 +889,8 @@ async def run(args: argparse.Namespace) -> None:
         return
     if not args.source:
         raise UserError("nothing to play.", "Give a video file or URL: `castomatic movie.mkv`.")
+    if config.is_first_run() and sys.stdout.isatty() and not getattr(args, "quiet", False):
+        banner.welcome()
     stream.ensure_ffmpeg()
 
     source = await sources.resolve(
@@ -717,6 +898,11 @@ async def run(args: argparse.Namespace) -> None:
     )
     if source.via_ytdlp:
         print(f"yt-dlp found: {source.title}" + (" (live)" if source.is_live else ""))
+    if source.via_castor:
+        print(f"castor found the video on {source.page_url}")
+    if args.engine == "castor":
+        await _cast_with_castor(args, source)
+        return
     # A yt-dlp video is streamed by yt-dlp itself into a local buffer and re-streamed from
     # there; ffmpeg never opens the site's address. --download-first fetches it all instead.
     relay = source.via_ytdlp and not args.download_first
@@ -726,8 +912,15 @@ async def run(args: argparse.Namespace) -> None:
     must_download = False
     try:
         if not relay:
-            summary = stream.summarize([await stream.probe_input(i) for i in source.inputs])
+            infos = [await stream.probe_input(i) for i in source.inputs]
+            summary = stream.summarize(infos)
+            if await _too_slow_to_stream(args, source, infos):
+                relay = True
     except stream.ProbeError as ex:
+        if source.via_castor:  # castor's stream only plays from inside castor
+            print(f"note: the stream castor found cannot be read directly ({ex.reason}); letting castor play it.")
+            await _cast_with_castor(args, source)
+            return
         if not source.via_ytdlp:
             raise
         # Sites often refuse ffmpeg's direct requests but let yt-dlp's downloader through
@@ -735,14 +928,25 @@ async def run(args: argparse.Namespace) -> None:
         must_download = True
     _check_start(args, (summary.duration if summary else None) or source.duration)
 
-    target = await targets.resolve_target(args.tv, args.protocol, args.choose, args.credentials)
+    found = await targets.resolve_targets(args.tv, args.protocol, args.choose, args.credentials)
+    ranked = await planner.order_targets(
+        found, args.mode, source, summary, args.start,
+        probe_dlna=_probe_dlna if len(found) > 1 else None,
+    )  # fmt: skip
+    if len(ranked) > 1:
+        _LOGGER.info("ways to reach the TV, in order:\n%s", "\n".join(planner.describe(ranked)))
+    attempts = [r.target for r in ranked]
+    target = attempts[0]
     print(f"{source.title}  ->  {target.tv.name} ({target.protocol.upper()})")
 
-    # A temporary folder is needed to convert to disk (--no-jit), and for AirPlay to be
-    # given a remote video, either as growing HLS segments or as a full download
+    # A temporary folder is needed to convert to disk (--no-jit), for a remote video sent
+    # as growing HLS segments (AirPlay, Chromecast, Roku), or for a full download
     remote_for_airplay = (
         target.protocol == "airplay" and not source.is_local
         and not (source.is_hls_playlist and not source.via_ytdlp)
+    )
+    live_hls = getattr(args, "burn_subtitles", False) or any(
+        _may_convert_live(t.protocol, source, args) for t in attempts
     )
     download = must_download or (args.download_first and (remote_for_airplay or source.via_ytdlp))
     workdir = None
@@ -751,7 +955,7 @@ async def run(args: argparse.Namespace) -> None:
     feed: Optional[tuple] = None
     if args.workdir and not Path(args.workdir).is_dir():
         raise UserError(f"--workdir {args.workdir} is not a folder.", "Create it, or leave --workdir out.")
-    if args.no_jit or remote_for_airplay or download or relay:
+    if args.no_jit or remote_for_airplay or download or relay or live_hls:
         workdir = tempfile.TemporaryDirectory(prefix="castomatic-", dir=args.workdir)
     try:
         path = Path(workdir.name) if workdir else None
@@ -766,10 +970,7 @@ async def run(args: argparse.Namespace) -> None:
         if download:
             source, summary = await _download_first(args, source, path)
             _check_start(args, summary.duration or source.duration)
-        if target.protocol == "dlna":
-            await _play_dlna(args, source, summary, target, path, buffered, fallback)
-        else:
-            await _play_airplay(args, source, summary, target, path, buffered, fallback)
+        await _play_with_failover(args, attempts, source, summary, path, buffered, fallback)
         if buffered or (fallback and fallback.media):
             await _finish_copy(buffered or fallback.media)
     finally:
@@ -787,11 +988,230 @@ async def run(args: argparse.Namespace) -> None:
                 pass
 
 
+REMOTE_MARGIN = 1.5  # a remote video must download this much faster than it plays
+
+
+async def _too_slow_to_stream(args: argparse.Namespace, source: sources.MediaSource, infos: List[dict]) -> bool:
+    """Whether a remote media address downloads too slowly to play without stalling.
+
+    If so it is buffered here first (a wait at the start instead of pauses part way),
+    exactly like a yt-dlp video. Only plain media addresses are checked: yt-dlp videos are
+    always buffered, and an HLS playlist is the TV's own business.
+    """
+    if source.is_local or source.via_ytdlp or source.is_hls_playlist or args.download_first:
+        return False
+    if len(source.inputs) != 1 or source.is_live:
+        return False
+    fmt = infos[0].get("format", {}) if infos else {}
+    try:
+        bitrate = float(fmt.get("bit_rate") or 0) / 8  # bytes per second
+    except (TypeError, ValueError):
+        bitrate = 0.0
+    if not bitrate:
+        return False
+    rate = await sources.measure_url_rate(source.inputs[0])
+    if rate is None:
+        return False
+    size = sources.format_size
+    _LOGGER.info("remote video: downloads at %s/s, plays at %s/s", size(rate), size(bitrate))
+    if rate >= REMOTE_MARGIN * bitrate:
+        return False
+    print(
+        f"note: this address downloads at {size(rate)}/s and the video plays at "
+        f"{size(bitrate)}/s, so it is buffered here first: playback may take a moment to "
+        "start, but will not stop part way."
+    )
+    return True
+
+
+async def _cast_with_castor(args: argparse.Namespace, source: sources.MediaSource) -> None:
+    """Hand the whole job to castor: the TV is found here, castor does the rest."""
+    from castomatic.engines import castor
+
+    if castor.find() is None:
+        raise UserError("--engine castor needs castor, which is not installed.", castor.INSTALL_HINT)
+    found = await targets.resolve_targets(args.tv, args.protocol, args.choose, args.credentials)
+    usable = [t for t in found if t.protocol in castor.DEVICE_TYPES]
+    if not usable:
+        raise UserError(
+            f"castor cannot reach {found[0].tv.name}: it plays to DLNA, Chromecast and Roku, "
+            f"and this TV offers {', '.join(found[0].tv.protocols)}.",
+            "Leave out --engine castor to play it with castomatic.",
+        )
+    target = usable[0]
+    what = source.page_url or source.location
+    print(f"{source.title}  ->  {target.tv.name} ({target.protocol.upper()}, via castor)")
+    await castor.cast(what, target.protocol, target.tv.host, target.tv.name, args.start, args.verbose)
+
+
+def _may_convert_live(protocol: str, source: sources.MediaSource, args: argparse.Namespace) -> bool:
+    """Whether playing over ``protocol`` could mean a live HLS conversion on disk."""
+    if protocol not in ("chromecast", "roku"):
+        return False
+    if protocol == "roku" and args.start > 0:
+        return True  # the Roku cannot start part way, so a conversion does it
+    return not source.is_local or source.via_ytdlp
+
+
+def _player_for(protocol: str) -> Callable[..., Awaitable[None]]:
+    """The function that plays over ``protocol`` (looked up now, so tests can replace it)."""
+    return {
+        "dlna": _play_dlna, "airplay": _play_airplay,
+        "chromecast": _play_chromecast, "roku": _play_roku,
+    }[protocol]  # fmt: skip
+
+
+async def _probe_dlna(target: targets.Target) -> Capabilities:
+    """Ask a DLNA renderer what it plays, to decide which protocol to try first."""
+    player = dlna.DlnaPlayer(target.tv.renderer)
+    await player.connect()
+    try:
+        return await player.capabilities()
+    finally:
+        await player.close()
+
+
+async def _play_with_failover(args, attempts, source, summary, workdir, buffered, fallback) -> None:
+    """Play over the first way that works.
+
+    If the TV fetched the video untouched but never started it, the same way is tried
+    again converting (unless --mode said otherwise). After that, the next protocol.
+    """
+    queue = [(target, args.mode) for target in attempts]
+    while queue:
+        target, mode = queue.pop(0)
+        retry_converting = mode == "auto"
+        now = argparse.Namespace(
+            **{**vars(args), "mode": mode, "failover": bool(queue) or retry_converting}
+        )
+        try:
+            await _player_for(target.protocol)(
+                now, source, summary, target, workdir, buffered, fallback
+            )
+            return
+        except StartFailed as ex:
+            if retry_converting and ex.untouched and ex.fetched:
+                queue.insert(0, (target, "convert"))
+                print(f"\nnote: {ex.reason}\n  Trying again, converting the video for it ...")
+                continue
+            if not queue:
+                raise ex.as_user_error() from ex
+            nxt = queue[0][0]
+            print(
+                f"\nnote: {ex.reason}\n  Trying {nxt.tv.name} over "
+                f"{targets.LABELS[nxt.protocol]} instead ..."
+            )
+
+
+async def explain(args: argparse.Namespace) -> None:
+    """``castomatic explain SOURCE``: everything ``castomatic SOURCE`` would decide, and why.
+
+    Nothing is played and nothing is remembered.
+    """
+    if not args.source:
+        raise UserError("nothing to explain.", "Give a video: `castomatic explain movie.mkv`.")
+    stream.ensure_ffmpeg()
+    source = await sources.resolve(args.source, args.ytdlp_format, args.cookies_from_browser, args.verbose)
+    found_by = "castor" if source.via_castor else "yt-dlp" if source.via_ytdlp else None
+    print(f"Source:    {source.title}" + (f"  (found by {found_by})" if found_by else ""))
+    print(f"Where:     {'this computer' if source.is_local else stream.describe(source.inputs[0])}")
+    summary = None
+    infos: List[dict] = []
+    try:
+        infos = [await stream.probe_input(i) for i in source.inputs]
+        summary = stream.summarize(infos)
+    except stream.ProbeError as ex:
+        print(f"Streams:   cannot be read directly ({ex.reason}); it would be buffered through yt-dlp")
+    if summary:
+        audio = summary.audio_codec or "none"
+        length = f"{summary.duration:.0f}s" if summary.duration else "unknown length"
+        print(f"Streams:   video {summary.video_codec} ({summary.pix_fmt or '?'}), audio {audio}, {length}")
+    await _explain_speed(source, summary, infos)
+
+    try:
+        found = await targets.resolve_targets(
+            args.tv, args.protocol, args.choose, args.credentials, interactive=sys.stdin.isatty()
+        )
+    except UserError as ex:
+        print(f"TV:        none ({ex.message})")
+        print("           Showing what would happen on each kind of TV instead.")
+        found = _every_kind_of_tv(args.protocol)
+        probe = None
+    else:
+        tv = found[0].tv
+        print(f"TV:        {tv.name} ({tv.host}), reachable over {', '.join(tv.protocols)}")
+        probe = _probe_dlna
+    ranked = await planner.order_targets(
+        found, args.mode, source, summary, args.start, probe_dlna=probe
+    )
+    print("Plan:      tried in this order, moving on if one does not start:")
+    for line in planner.describe(ranked):
+        print(line)
+    if args.mode == "auto" and any(r.delivery and r.delivery.untouched for r in ranked):
+        print("           (a TV that fetches the untouched video but cannot play it is sent a converted copy)")
+    caps = {
+        targets.LABELS[r.target.protocol]: planner.static_capabilities(r.target.protocol)
+        for r in ranked if planner.static_capabilities(r.target.protocol)
+    }  # fmt: skip
+    if caps:
+        print("What each protocol plays as it is:")
+        for line in planner.capabilities_summary(caps):
+            print(line)
+
+
+def _every_kind_of_tv(protocol: str) -> List[targets.Target]:
+    """A pretend TV offering every protocol (paired), for explaining with no TV around."""
+    from castomatic.backends.chromecast import ChromecastInfo
+    from castomatic.backends.roku import RokuInfo
+
+    tv = targets.TV(
+        "a TV", "0.0.0.0",
+        dlna.Renderer("http://0.0.0.0/", "a TV", "", "http://0.0.0.0/"),
+        targets.AirPlayInfo("", "0.0.0.0", 7000, object(), "a TV"),  # type: ignore[arg-type]
+        ChromecastInfo("a TV", "0.0.0.0"), RokuInfo("a TV", "0.0.0.0"),
+    )  # fmt: skip
+    return targets.candidate_targets(tv, protocol)
+
+
+async def _explain_speed(source: sources.MediaSource, summary: Optional[stream.Summary], infos: List[dict]) -> None:
+    """Say whether the video arrives fast enough to play straight away."""
+    duration = (summary.duration if summary else None) or source.duration
+    if source.via_ytdlp:
+        print("Buffering: yes: web videos are buffered here first, until playing cannot run dry")
+        return
+    if source.is_local and source.path and duration:
+        rate = await buffering.measure_rate(source.path)
+        bitrate = source.path.stat().st_size / duration
+        network = " (network share)" if buffering.is_network_path(source.path) else ""
+        factor = buffering.FAST_FACTOR * (buffering.NETWORK_FACTOR if network else 1.0)
+        size = sources.format_size
+        if rate is None:
+            print(f"Buffering: no{network}: reading speed could not be measured")
+        elif rate >= factor * bitrate:
+            print(f"Buffering: not needed{network}: reads at {size(rate)}/s, plays at {size(bitrate)}/s")
+        else:
+            print(f"Buffering: yes{network}: reads at {size(rate)}/s, plays at {size(bitrate)}/s, so a local copy leads the way")
+        return
+    if not source.is_local and not source.is_hls_playlist and infos:
+        try:
+            bitrate = float(infos[0].get("format", {}).get("bit_rate") or 0) / 8
+        except (TypeError, ValueError):
+            bitrate = 0.0
+        rate = await sources.measure_url_rate(source.inputs[0]) if bitrate else None
+        if rate is None:
+            print("Buffering: unknown: the download speed could not be measured")
+        elif rate >= REMOTE_MARGIN * bitrate:
+            print(f"Buffering: not needed: downloads at {sources.format_size(rate)}/s, plays at {sources.format_size(bitrate)}/s")
+        else:
+            print(f"Buffering: yes: downloads at {sources.format_size(rate)}/s, plays at {sources.format_size(bitrate)}/s")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The command line."""
     parser = argparse.ArgumentParser(
         prog="castomatic",
-        description="Play a video file or URL on your TV (DLNA or AirPlay).",
+        description="Cast anything anywhere: play a video file, URL or web page on any TV "
+        "(Chromecast, DLNA, Roku or AirPlay 2).",
         epilog=EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -811,8 +1231,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--list", action="store_true", help="list the TVs found on the network and exit"
     )  # fmt: skip
     tv.add_argument(
-        "--protocol", choices=["auto", "dlna", "airplay"], default="auto",
-        help="auto (default) uses DLNA when the TV has it, else AirPlay",
+        "--protocol", choices=["auto", *targets.PROTOCOLS], default="auto",
+        help="auto (default) tries the way that plays the video as it is first, then the "
+        "most reliable (Chromecast, DLNA, Roku, AirPlay), moving on if one fails",
     )  # fmt: skip
     play = parser.add_argument_group("playback")
     play.add_argument("--start", type=float, default=0.0, metavar="SECONDS", help="start position")
@@ -826,6 +1247,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="subtitle file (.srt/.vtt); by default one next to the video or inside it is used",
     )  # fmt: skip
     play.add_argument("--no-subtitles", action="store_true", help="send no subtitles")
+    play.add_argument(
+        "--burn-subtitles", action="store_true",
+        help="draw the subtitles onto the picture (re-encodes the video); for TVs that take "
+        "no subtitle file, such as Roku's media player",
+    )  # fmt: skip
     play.add_argument(
         "--download-first", action="store_true",
         help="AirPlay with a web or remote video: download all of it, with progress, before "
@@ -842,14 +1268,48 @@ def build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     adv = parser.add_argument_group("advanced")
     adv.add_argument(
+        "--engine", choices=["castomatic", "castor"], default="castomatic",
+        help="castor (if installed) hands the whole cast to castor instead; castomatic "
+        "already asks castor for pages yt-dlp cannot read",
+    )  # fmt: skip
+    adv.add_argument(
         "--no-jit", action="store_true", help="HLS only: convert everything to disk before playing"
     )  # fmt: skip
     adv.add_argument("--workdir", metavar="DIR", help="where --no-jit writes (default: temporary)")
     adv.add_argument("--credentials", help="AirPlay credentials, overriding the stored ones")
     adv.add_argument(
-        "-v", "--verbose", action="store_true", help="show everything sent and received"
+        "-v", "--verbose", action="count", default=0,
+        help="-v shows each decision and why; -vv also everything sent to and from the TV",
     )  # fmt: skip
+    adv.add_argument("--log-file", metavar="FILE", help="also write the full (-vv) log to FILE")
+    adv.add_argument("-q", "--quiet", action="store_true", help="no welcome or banner")
     return parser
+
+
+def setup_logging(verbose: int, log_file: Optional[str] = None) -> None:
+    """-v: castomatic's decisions (INFO). -vv: everything, protocol traffic included (DEBUG)."""
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.DEBUG if verbose >= 2 else logging.INFO if verbose == 1 else logging.WARNING)
+    fmt = "%(asctime)s %(name)s: %(message)s" if verbose >= 2 else "%(name)s: %(message)s"
+    console.setFormatter(logging.Formatter(fmt, "%H:%M:%S"))
+    root.addHandler(console)
+    level = console.level
+    if log_file:
+        try:
+            to_file = logging.FileHandler(log_file)
+        except OSError as ex:
+            raise UserError(f"cannot write the log to {log_file}: {ex.strerror or ex}.") from ex
+        to_file.setLevel(logging.DEBUG)
+        to_file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        root.addHandler(to_file)
+        level = logging.DEBUG
+    root.setLevel(level)
+    if verbose < 2:  # libraries' own chatter only at -vv
+        for noisy in ("pychromecast", "zeroconf", "pyatv", "aiohttp", "asyncio", "rokuecp"):
+            logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -857,13 +1317,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["play"]:  # the old ``castomatic play FILE`` form still works
         argv = argv[1:]
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING, format="%(name)s: %(message)s"
-    )
+    command = run
+    if argv[:1] == ["doctor"]:
+        from castomatic import doctor
+
+        args = doctor.build_parser().parse_args(argv[1:])
+        command = doctor.run
+    else:
+        if argv[:1] == ["explain"]:
+            argv, command = argv[1:], explain
+        if argv in ([], ["-h"], ["--help"]) and sys.stdout.isatty():
+            banner.show()
+        args = build_parser().parse_args(argv)
     try:
-        asyncio.run(run(args))
-        return 0
+        setup_logging(args.verbose, getattr(args, "log_file", None))
+        status = asyncio.run(command(args))
+        return status if isinstance(status, int) else 0
     except KeyboardInterrupt:
         print("\nStopped.")
         return 130

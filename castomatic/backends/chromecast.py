@@ -272,6 +272,9 @@ class ChromecastPlayer:
             if played and state in (STATE_STOPPED, STATE_NO_MEDIA):
                 self.ended.set()
                 return
+            if state == STATE_STOPPED and reason in ("FINISHED", "CANCELLED", "INTERRUPTED"):
+                self.ended.set()  # it played and finished between two looks
+                return
             if not played and loop.time() - began > 10 * PLAY_WAIT:
                 self.ended.set()  # never started: stop waiting on it
                 return
