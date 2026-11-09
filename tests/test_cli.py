@@ -10,11 +10,11 @@ import aiohttp
 import pytest
 from pyatv import exceptions as pyatv_exceptions
 
-from pyatv_cast import buffering, cli, config, dlna, sources, stream, targets
-from pyatv_cast.errors import UserError
-from pyatv_cast.airplay import AirPlayError
-from pyatv_cast.sources import Input, MediaSource
-from pyatv_cast.targets import TV, AirPlayInfo, Target
+from castomatic import buffering, cli, config, dlna, sources, stream, targets
+from castomatic.errors import UserError
+from castomatic.airplay import AirPlayError
+from castomatic.sources import Input, MediaSource
+from castomatic.targets import TV, AirPlayInfo, Target
 from tests.test_hls import _make_video
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -474,7 +474,7 @@ async def test_forget(isolated_config, capsys):
 async def test_run_without_a_source_explains():
     with pytest.raises(UserError, match="nothing to play") as info:
         await cli.run(parse())
-    assert "pyatv-cast movie.mkv" in info.value.hint
+    assert "castomatic movie.mkv" in info.value.hint
 
 
 async def test_list_shows_tvs_and_marks_yours(isolated_config, monkeypatch, capsys):
@@ -629,7 +629,7 @@ def test_main_defaults_to_sys_argv(monkeypatch):
         assert args.source == "from_argv.mp4"
 
     monkeypatch.setattr(cli, "run", fine)
-    monkeypatch.setattr(sys, "argv", ["pyatv-cast", "from_argv.mp4"])
+    monkeypatch.setattr(sys, "argv", ["castomatic", "from_argv.mp4"])
     assert cli.main() == 0
 
 
@@ -637,7 +637,7 @@ def test_help_lists_examples(capsys):
     with pytest.raises(SystemExit):
         cli.main(["--help"])
     out = capsys.readouterr().out
-    assert "pyatv-cast movie.mkv" in out and "--cookies-from-browser" in out and "--choose" in out
+    assert "castomatic movie.mkv" in out and "--cookies-from-browser" in out and "--choose" in out
 
 
 # -- live streaming and downloading for AirPlay ----------------------------------------------

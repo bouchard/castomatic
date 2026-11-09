@@ -9,7 +9,7 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from pyatv_cast import hls
+from castomatic import hls
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg not installed"

@@ -12,9 +12,9 @@ import pytest
 import yt_dlp.utils
 from aiohttp import web
 
-from pyatv_cast import sources
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import Input, MediaSource
+from castomatic import sources
+from castomatic.errors import UserError
+from castomatic.sources import Input, MediaSource
 
 Usage = namedtuple("Usage", "total used free")
 
@@ -81,7 +81,7 @@ def test_a_stuck_thread_cannot_keep_the_program_alive():
     script = textwrap.dedent(
         """
         import asyncio, time
-        from pyatv_cast import sources
+        from castomatic import sources
         async def main():
             sources._in_daemon_thread(time.sleep, 60)   # stuck, as yt-dlp can be when rate limited
             await asyncio.sleep(0.2)

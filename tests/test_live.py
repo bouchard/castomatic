@@ -6,9 +6,9 @@ import shutil
 import pytest
 from aiohttp import web
 
-from pyatv_cast import live, stream
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import Input
+from castomatic import live, stream
+from castomatic.errors import UserError
+from castomatic.sources import Input
 from tests.test_hls import _make_video
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")

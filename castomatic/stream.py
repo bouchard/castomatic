@@ -20,8 +20,8 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import Input
+from castomatic.errors import UserError
+from castomatic.sources import Input
 
 _LOGGER = logging.getLogger(__name__)
 

@@ -7,7 +7,7 @@ before it has been copied. Reads go through a ``read_at(offset, length)`` callab
 
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from pyatv_cast.mp4index import Mp4Index
+from castomatic.mp4index import Mp4Index
 
 ReadAt = Callable[[int, int], bytes]
 

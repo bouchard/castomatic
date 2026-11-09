@@ -14,8 +14,8 @@ from pyatv.auth.hap_pairing import HapCredentials, parse_credentials
 from pyatv.const import Protocol
 from pyatv.storage.file_storage import FileStorage
 
-from pyatv_cast import config, dlna
-from pyatv_cast.errors import UserError
+from castomatic import config, dlna
+from castomatic.errors import UserError
 
 _LOGGER = logging.getLogger(__name__)
 DLNA_TIMEOUT = 3.0

@@ -3,9 +3,9 @@
 import pytest
 from aiohttp import web
 
-from pyatv_cast import sources
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import Input, MediaSource
+from castomatic import sources
+from castomatic.errors import UserError
+from castomatic.sources import Input, MediaSource
 
 
 async def test_resolve_local_file(tmp_path):

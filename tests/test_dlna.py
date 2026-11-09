@@ -8,7 +8,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from pyatv_cast import dlna
+from castomatic import dlna
 
 REAL_LOCAL_ADDRESSES = dlna.local_addresses
 

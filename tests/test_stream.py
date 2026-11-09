@@ -8,9 +8,9 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from pyatv_cast import stream
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import Input
+from castomatic import stream
+from castomatic.errors import UserError
+from castomatic.sources import Input
 from tests.test_hls import _make_video
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -234,7 +234,7 @@ async def test_stream_server_reports_ffmpeg_failures(tmp_path):
 
 @needs_ffmpeg
 async def test_stream_server_serves_a_subtitle_shifted_to_the_start(tmp_path):
-    from pyatv_cast import subtitles
+    from castomatic import subtitles
 
     srt = tmp_path / "in.srt"
     srt.write_text("1\n00:00:02,000 --> 00:00:03,000\nEarly\n\n2\n00:00:12,000 --> 00:00:13,000\nLate\n\n")

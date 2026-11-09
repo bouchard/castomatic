@@ -1,4 +1,4 @@
-"""Command line: ``pyatv-cast SOURCE`` plays a file or URL on your TV.
+"""Command line: ``castomatic SOURCE`` plays a file or URL on your TV.
 
 With no other options it finds the TV (asking once if there are several, then
 remembering), sends the file untouched if the TV can play it, converts just in time if not,
@@ -19,10 +19,10 @@ from typing import Any, List, Optional
 import aiohttp
 from pyatv import exceptions as pyatv_exceptions
 
-from pyatv_cast import buffering, config, dlna, hls, sources, stream, subtitles, targets, ytstream
-from pyatv_cast.errors import UPNP_HINTS, UserError
-from pyatv_cast.airplay import AirPlayError, AirPlayPlayer
-from pyatv_cast.live import LiveHls
+from castomatic import buffering, config, dlna, hls, sources, stream, subtitles, targets, ytstream
+from castomatic.errors import UPNP_HINTS, UserError
+from castomatic.airplay import AirPlayError, AirPlayPlayer
+from castomatic.live import LiveHls
 
 HLS_MIME = "application/vnd.apple.mpegurl"
 # pyatv has no common base class for its errors; these are the ones a connection can raise
@@ -46,11 +46,11 @@ RESTARTS = 5  # an AirPlay receiver that drops the video is given it again this 
 WATCH_INTERVAL = 2.0
 EXAMPLES = """\
 examples:
-  pyatv-cast movie.mkv                     play a file on your TV
-  pyatv-cast https://youtu.be/VIDEO        any page yt-dlp understands
-  pyatv-cast movie.mkv --start 600         begin 10 minutes in
-  pyatv-cast --list                        show the TVs on the network
-  pyatv-cast movie.mkv --choose            pick a different TV
+  castomatic movie.mkv                     play a file on your TV
+  castomatic https://youtu.be/VIDEO        any page yt-dlp understands
+  castomatic movie.mkv --start 600         begin 10 minutes in
+  castomatic --list                        show the TVs on the network
+  castomatic movie.mkv --choose            pick a different TV
 """
 
 
@@ -709,7 +709,7 @@ async def run(args: argparse.Namespace) -> None:
         await _list(args)
         return
     if not args.source:
-        raise UserError("nothing to play.", "Give a video file or URL: `pyatv-cast movie.mkv`.")
+        raise UserError("nothing to play.", "Give a video file or URL: `castomatic movie.mkv`.")
     stream.ensure_ffmpeg()
 
     source = await sources.resolve(
@@ -752,7 +752,7 @@ async def run(args: argparse.Namespace) -> None:
     if args.workdir and not Path(args.workdir).is_dir():
         raise UserError(f"--workdir {args.workdir} is not a folder.", "Create it, or leave --workdir out.")
     if args.no_jit or remote_for_airplay or download or relay:
-        workdir = tempfile.TemporaryDirectory(prefix="pyatv-cast-", dir=args.workdir)
+        workdir = tempfile.TemporaryDirectory(prefix="castomatic-", dir=args.workdir)
     try:
         path = Path(workdir.name) if workdir else None
         if relay:
@@ -790,7 +790,7 @@ async def run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """The command line."""
     parser = argparse.ArgumentParser(
-        prog="pyatv-cast",
+        prog="castomatic",
         description="Play a video file or URL on your TV (DLNA or AirPlay).",
         epilog=EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -855,7 +855,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point. Returns the exit status."""
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv[:1] == ["play"]:  # the old ``pyatv-cast play FILE`` form still works
+    if argv[:1] == ["play"]:  # the old ``castomatic play FILE`` form still works
         argv = argv[1:]
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -874,7 +874,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(
             f"error: something unexpected went wrong: {type(ex).__name__}: {ex}\n"
             "  hint: run again with -v for details; if it keeps happening, please report it "
-            "at https://github.com/bouchard/pyatv-cast/issues",
+            "at https://github.com/bouchard/castomatic/issues",
             file=sys.stderr,
         )
         if args.verbose:

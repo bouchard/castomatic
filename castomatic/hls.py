@@ -51,7 +51,7 @@ class MediaPlan:
     bandwidth: int = 8_000_000
     resolution: Optional[str] = None
     codecs: Optional[str] = None  # only known when the streams are copied as they are
-    subtitle: Optional[Any] = None  # a pyatv_cast.subtitles.Subtitle
+    subtitle: Optional[Any] = None  # a castomatic.subtitles.Subtitle
     # Added to every segment's timestamps. The first video packet has a negative decode
     # time, which the muxer would otherwise shift for segment 0 only.
     ts_shift: float = 0.0
@@ -220,8 +220,8 @@ async def plan(
 ) -> MediaPlan:
     """Probe ``source`` and decide what has to be converted.
 
-    ``subtitle`` is an optional :class:`pyatv_cast.subtitles.Subtitle` to offer with it.
-    ``index`` is a :class:`pyatv_cast.mp4index.Mp4Index`; with it the keyframes come from
+    ``subtitle`` is an optional :class:`castomatic.subtitles.Subtitle` to offer with it.
+    ``index`` is a :class:`castomatic.mp4index.Mp4Index`; with it the keyframes come from
     the file's index instead of ffprobe reading every packet, which a slow or partly
     copied file cannot afford.
     """

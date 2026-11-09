@@ -1,11 +1,11 @@
-# pyatv-cast
+# castomatic
 
 Play a video file or a web video on your TV, with one command:
 
 ```sh
-pyatv-cast movie.mkv
-pyatv-cast https://www.youtube.com/watch?v=VIDEO
-pyatv-cast movie.mkv --start 600          # begin ten minutes in
+castomatic movie.mkv
+castomatic https://www.youtube.com/watch?v=VIDEO
+castomatic movie.mkv --start 600          # begin ten minutes in
 ```
 
 It finds your TV, sends the video the easiest way the TV allows, and tells you what to do
@@ -47,15 +47,15 @@ By default the TV is found automatically.
 
 - With **one** TV on the network it is used and remembered.
 - With **several**, you are asked once, and the answer is remembered in
-  `~/.config/pyatv-cast/config.json` (it holds only the TV's name and address, never
+  `~/.config/castomatic/config.json` (it holds only the TV's name and address, never
   credentials).
 - From then on the remembered TV is used without searching the network.
 
 ```sh
-pyatv-cast --list                      # show the TVs found
-pyatv-cast movie.mkv --choose          # pick a different TV (and remember it)
-pyatv-cast movie.mkv --tv Bedroom      # this TV, just this once (name, IP or id)
-pyatv-cast --forget                    # forget the remembered TV
+castomatic --list                      # show the TVs found
+castomatic movie.mkv --choose          # pick a different TV (and remember it)
+castomatic movie.mkv --tv Bedroom      # this TV, just this once (name, IP or id)
+castomatic --forget                    # forget the remembered TV
 ```
 
 `--protocol dlna` or `--protocol airplay` forces one; the default `auto` uses DLNA when the
@@ -87,7 +87,7 @@ text track inside it. Conversion happens in memory.
 - **AirPlay**: offered as a WebVTT track. Most TVs only load it once **you select it in
   the TV's own subtitle menu**.
 
-Videos downloaded by yt-dlp are kept in `pyatv-cast-cache` inside the system temporary folder
+Videos downloaded by yt-dlp are kept in `castomatic-cache` inside the system temporary folder
 (which the OS clears on its own), so playing the same address again, in the same format, reuses
 the copy instead of downloading it again.
 
@@ -176,7 +176,7 @@ segment and the next with no interruption. A file sent as is, or a live conversi
 renderer to the old address, so it is paused, the copy gets ahead of that position, and the
 video is reloaded where it was. A short interruption beats the video dying on the TV.
 
-Copies live in `pyatv-cast-cache-<user>/files` inside the system's temporary folder, which the
+Copies live in `castomatic-cache-<user>/files` inside the system's temporary folder, which the
 OS clears on its own, so a copy lasts until then. When the disk is short of room the least recently used copies are removed; if there is still no room, the
 video plays directly from the file.
 
@@ -225,7 +225,7 @@ folder is removed when playback ends or you press Ctrl-C.
 ## Library use
 
 ```python
-from pyatv_cast import DlnaPlayer, JitHlsServer, find_renderer, plan
+from castomatic import DlnaPlayer, JitHlsServer, find_renderer, plan
 from pathlib import Path
 
 player = DlnaPlayer(await find_renderer(host="192.168.1.50"))
@@ -237,7 +237,7 @@ await player.wait_until_ended()
 await player.stop(); await server.stop(); await player.close()
 ```
 
-`AirPlayPlayer` (AirPlay) has the same methods; see `pyatv_cast/cli.py` for a complete example
+`AirPlayPlayer` (AirPlay) has the same methods; see `castomatic/cli.py` for a complete example
 of choosing a delivery method.
 
 ## Development
@@ -285,7 +285,7 @@ sender relies on pyatv for:
   `pyatv.protocols.airplay.ap2_session`).
 - **RTSP/HTTP transport.** The connection and request/response handling used to talk to the
   receiver (`pyatv.support.http`, `pyatv.support.rtsp`).
-- **The event channel.** `pyatv_cast.airplay` subclasses pyatv's `EventChannel` to read the
+- **The event channel.** `castomatic.airplay` subclasses pyatv's `EventChannel` to read the
   receiver's playback events, and its `AirPlayError` extends pyatv's `PlaybackError`.
 
 pyatv's server-side pairing code was also used to build a throw-away fake AirPlay receiver

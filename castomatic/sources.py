@@ -21,7 +21,7 @@ from urllib.parse import unquote, urlparse
 
 import aiohttp
 
-from pyatv_cast.errors import UserError
+from castomatic.errors import UserError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ async def resolve(
     raise UserError(
         f"{text}: no such file, and it does not look like a URL.",
         "Check the spelling, and quote paths that contain spaces or brackets: "
-        '`pyatv-cast "My Movie (2026).mkv"`.',
+        '`castomatic "My Movie (2026).mkv"`.',
     )
 
 
@@ -397,7 +397,7 @@ def cache_dir(source: "MediaSource") -> Path:
     """Where yt-dlp downloads of this video (in this format) are kept between runs."""
     key = hashlib.sha1(f"{source.page_url}\n{source.ytdlp_format}".encode()).hexdigest()[:16]
     owner = os.getuid() if hasattr(os, "getuid") else "user"  # one folder per user: /tmp is shared
-    return Path(tempfile.gettempdir()) / f"pyatv-cast-cache-{owner}" / key
+    return Path(tempfile.gettempdir()) / f"castomatic-cache-{owner}" / key
 
 
 def _cached_video(directory: Path) -> Optional[Path]:

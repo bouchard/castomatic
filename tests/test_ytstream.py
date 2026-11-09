@@ -9,9 +9,9 @@ import textwrap
 import aiohttp
 import pytest
 
-from pyatv_cast import stream, ytstream
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import MediaSource
+from castomatic import stream, ytstream
+from castomatic.errors import UserError
+from castomatic.sources import MediaSource
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 

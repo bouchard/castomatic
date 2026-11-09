@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from pyatv_cast import mp4index
+from castomatic import mp4index
 
 
 def box(kind, *parts):

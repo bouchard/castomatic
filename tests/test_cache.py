@@ -7,9 +7,9 @@ import time
 
 import pytest
 
-from pyatv_cast import cache as cache_mod
-from pyatv_cast.cache import BlockCache, CacheError
-from pyatv_cast.errors import UserError
+from castomatic import cache as cache_mod
+from castomatic.cache import BlockCache, CacheError
+from castomatic.errors import UserError
 
 BLOCK = 16
 
@@ -54,7 +54,7 @@ def hold(cache, order=None):
 def test_cache_root_and_folder(monkeypatch, tmp_path):
     monkeypatch.undo()
     monkeypatch.setattr(cache_mod.tempfile, "tempdir", str(tmp_path))
-    assert cache_mod.default_cache_root() == tmp_path / f"pyatv-cast-cache-{os.getuid()}" / "files"
+    assert cache_mod.default_cache_root() == tmp_path / f"castomatic-cache-{os.getuid()}" / "files"
     monkeypatch.undo()
 
     one = cache_mod.cache_dir(tmp_path, tmp_path / "The Movie (2009).mp4")
@@ -163,7 +163,7 @@ def test_an_empty_source_or_unusable_folder_is_refused(tmp_path, source):
         BlockCache.open(source, blocker)
 
 
-def test_two_copies_of_pyatv_cast_cannot_fill_one_cache(source, tmp_path):
+def test_two_copies_of_castomatic_cannot_fill_one_cache(source, tmp_path):
     first = opened(source, tmp_path)
     with pytest.raises(CacheError, match="already using"):
         opened(source, tmp_path)

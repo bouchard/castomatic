@@ -104,7 +104,7 @@ class AirPlayPlayer:
         credentials: Optional[HapCredentials] = None,
         secure: Optional[SecureFunc] = None,
         on_event: Optional[EventFunc] = None,
-        name: str = "pyatv-cast",
+        name: str = "castomatic",
     ) -> None:
         """Initialize a new AirPlayPlayer."""
         self._address = address
@@ -147,7 +147,7 @@ class AirPlayPlayer:
                 "deviceID": "02:00:00:00:00:01",
                 "groupContainsGroupLeader": False,
                 "groupUUID": str(uuid4()),
-                "model": "pyatv-cast",
+                "model": "castomatic",
                 "name": self._name,
                 "senderSupportsRelay": True,
                 "sessionUUID": "00000000-0000-0000-0000-000000000000",

@@ -9,8 +9,8 @@ import pytest
 from pyatv import exceptions
 from pyatv.support.http import HttpRequest, format_request
 
-from pyatv_cast import airplay
-from pyatv_cast.airplay import AirPlayError, AirPlayPlayer
+from castomatic import airplay
+from castomatic.airplay import AirPlayError, AirPlayPlayer
 
 
 async def _read_message(reader: asyncio.StreamReader):

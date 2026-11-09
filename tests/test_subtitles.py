@@ -7,7 +7,7 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from pyatv_cast import dlna, hls, subtitles
+from castomatic import dlna, hls, subtitles
 from tests.test_hls import _make_video
 
 needs_ffmpeg = pytest.mark.skipif(

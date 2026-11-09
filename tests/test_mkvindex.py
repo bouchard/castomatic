@@ -1,6 +1,6 @@
 """Tests for reading the Matroska keyframe index."""
 
-from pyatv_cast import mkvindex as mk
+from castomatic import mkvindex as mk
 
 
 def size(n):

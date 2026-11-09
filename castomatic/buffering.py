@@ -5,7 +5,7 @@ tired USB disk and a busy NAS all look the same here.
 
 * :func:`choose` times cold reads spread across the file and compares them with what the
   video needs. There is no switch for this.
-* :class:`BufferedMedia` owns the :class:`~pyatv_cast.cache.BlockCache` and a loopback HTTP
+* :class:`BufferedMedia` owns the :class:`~castomatic.cache.BlockCache` and a loopback HTTP
   server. A read of bytes not yet copied waits for them and makes the copy fetch them next,
   which is how seeking works, for ffmpeg and for a renderer alike.
 * :meth:`BufferedMedia.wait_ready` holds playback back until what is already copied, plus
@@ -25,11 +25,11 @@ from typing import Any, Callable, List, Optional
 
 from aiohttp import web
 
-from pyatv_cast import cache as cache_mod
-from pyatv_cast import hls, mkvindex, mp4index
-from pyatv_cast.cache import BlockCache, CacheError
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import _in_daemon_thread
+from castomatic import cache as cache_mod
+from castomatic import hls, mkvindex, mp4index
+from castomatic.cache import BlockCache, CacheError
+from castomatic.errors import UserError
+from castomatic.sources import _in_daemon_thread
 
 _LOGGER = logging.getLogger(__name__)
 

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 from pyatv.const import Protocol
 
-from pyatv_cast import config, dlna, targets
-from pyatv_cast.errors import UserError
-from pyatv_cast.targets import TV, AirPlayInfo
+from castomatic import config, dlna, targets
+from castomatic.errors import UserError
+from castomatic.targets import TV, AirPlayInfo
 
 
 def renderer(host="10.0.0.5", name="Living Room TV"):

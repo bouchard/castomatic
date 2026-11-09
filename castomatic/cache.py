@@ -28,8 +28,8 @@ from collections import deque
 from pathlib import Path
 from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import _in_daemon_thread
+from castomatic.errors import UserError
+from castomatic.sources import _in_daemon_thread
 
 try:  # not on Windows
     import fcntl
@@ -63,7 +63,7 @@ class CacheError(UserError):
 def default_cache_root() -> Path:
     """Where copies are kept: our folder in the system's temporary folder, one per user."""
     owner = os.getuid() if hasattr(os, "getuid") else "user"  # the temporary folder is shared
-    return Path(tempfile.gettempdir()) / f"pyatv-cast-cache-{owner}" / "files"
+    return Path(tempfile.gettempdir()) / f"castomatic-cache-{owner}" / "files"
 
 
 def cache_dir(root: Path, source: Path) -> Path:
@@ -149,7 +149,7 @@ class BlockCache:
         """Open (or start) the copy of ``source``, discarding an old one of a different size.
 
         Raises :class:`CacheError` if the folder cannot be used (including when another
-        pyatv-cast is already filling the same copy).
+        castomatic is already filling the same copy).
         """
         size = source.stat().st_size
         if size <= 0:
@@ -206,7 +206,7 @@ class BlockCache:
         try:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as ex:
-            raise CacheError("another pyatv-cast is already using this video's cache") from ex
+            raise CacheError("another castomatic is already using this video's cache") from ex
 
     def _load(self) -> None:
         """Read the saved block map, if it still describes this source and data file."""
@@ -531,7 +531,7 @@ def _last_used(folder: Path) -> float:
 
 
 def _in_use(folder: Path) -> bool:
-    """Whether a running pyatv-cast holds this copy."""
+    """Whether a running castomatic holds this copy."""
     if fcntl is None:  # pragma: no cover
         return False
     try:

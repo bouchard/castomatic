@@ -11,8 +11,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from pyatv_cast import stream
-from pyatv_cast.errors import UserError
+from castomatic import stream
+from castomatic.errors import UserError
 
 _LOGGER = logging.getLogger(__name__)
 READY_SEGMENTS = 2

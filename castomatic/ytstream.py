@@ -18,9 +18,9 @@ from typing import Any, Callable, List, Optional
 
 from aiohttp import web
 
-from pyatv_cast import stream
-from pyatv_cast.errors import UserError
-from pyatv_cast.sources import MediaSource, _clean
+from castomatic import stream
+from castomatic.errors import UserError
+from castomatic.sources import MediaSource, _clean
 
 _LOGGER = logging.getLogger(__name__)
 

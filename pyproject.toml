@@ -1,33 +1,35 @@
 [project]
-name = "pyatv-cast"
+name = "castomatic"
 version = "0.1.0"
-description = "Play a video file or web video on your TV over DLNA or AirPlay, converting just in time only when needed"
+description = "Cast anything anywhere: play a file, URL or web video on any TV over Chromecast, DLNA, Roku or AirPlay 2, converting only when needed"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Brady Bouchard" }]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
     "pyatv>=0.16",
     "srptools<2",
     "aiohttp",
     "ifaddr",
     "yt-dlp",
+    "catt>=0.13",
+    "rokuecp>=0.19",
 ]
 
 [project.urls]
-Homepage = "https://github.com/bouchard/pyatv-cast"
-Issues = "https://github.com/bouchard/pyatv-cast/issues"
+Homepage = "https://github.com/bouchard/castomatic"
+Issues = "https://github.com/bouchard/castomatic/issues"
 
 [project.scripts]
-pyatv-cast = "pyatv_cast.cli:main"
+castomatic = "castomatic.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["pyatv_cast"]
+packages = ["castomatic"]
 
 [dependency-groups]
 dev = ["pytest", "pytest-asyncio", "pytest-cov"]
@@ -37,7 +39,7 @@ asyncio_mode = "auto"
 addopts = "--cov --cov-report=term-missing"
 
 [tool.coverage.run]
-source = ["pyatv_cast"]
+source = ["castomatic"]
 
 [tool.coverage.report]
 fail_under = 95

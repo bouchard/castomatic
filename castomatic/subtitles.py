@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from pyatv_cast import hls
+from castomatic import hls
 
 _LOGGER = logging.getLogger(__name__)
 

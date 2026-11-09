@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from pyatv_cast import config
-from pyatv_cast.errors import UPNP_HINTS, UserError
+from castomatic import config
+from castomatic.errors import UPNP_HINTS, UserError
 
 
 def test_error_renders_message_and_hint():
@@ -22,9 +22,9 @@ def test_upnp_hints_cover_the_common_codes():
 def test_config_lives_under_dot_config(monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(config.Path, "home", lambda: tmp_path)
-    assert config.config_path() == tmp_path / ".config" / "pyatv-cast" / "config.json"
+    assert config.config_path() == tmp_path / ".config" / "castomatic" / "config.json"
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    assert config.config_path() == tmp_path / "xdg" / "pyatv-cast" / "config.json"
+    assert config.config_path() == tmp_path / "xdg" / "castomatic" / "config.json"
 
 
 def test_save_load_and_forget(monkeypatch, tmp_path):
@@ -70,3 +70,25 @@ def test_forget_reports_an_unwritable_config(monkeypatch, tmp_path):
     monkeypatch.setattr(config.Path, "write_text", refuse)
     with pytest.raises(UserError, match="could not update"):
         config.forget_tv()
+
+
+def test_legacy_pyatv_cast_config_is_carried_over(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert config.is_first_run()
+    legacy = tmp_path / "pyatv-cast" / "config.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"tv": {"name": "Old", "host": "10.0.0.9"}}))
+    assert not config.is_first_run()
+    assert config.saved_tv() == {"name": "Old", "host": "10.0.0.9"}
+    config.save_tv({"name": "New", "host": "10.0.0.8"})
+    assert json.loads(config.config_path().read_text())["tv"]["name"] == "New"
+    assert json.loads(legacy.read_text())["tv"]["name"] == "Old"  # never modified
+
+
+def test_forget_with_only_a_legacy_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    legacy = tmp_path / "pyatv-cast" / "config.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"tv": {"name": "Old", "host": "10.0.0.9"}}))
+    assert config.forget_tv() is True
+    assert config.saved_tv() is None

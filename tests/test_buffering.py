@@ -6,9 +6,9 @@ import shutil
 import aiohttp
 import pytest
 
-from pyatv_cast import buffering, cache as cache_mod, dlna, hls, mp4index, subtitles
-from pyatv_cast.cache import BlockCache, CacheError
-from pyatv_cast.errors import UserError
+from castomatic import buffering, cache as cache_mod, dlna, hls, mp4index, subtitles
+from castomatic.cache import BlockCache, CacheError
+from castomatic.errors import UserError
 from tests.test_mp4index import box, moov, video_trak
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
