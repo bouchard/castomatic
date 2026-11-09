@@ -78,7 +78,7 @@ def choose_delivery(
         if mode == "convert":
             reasons = reasons or ["--mode convert"]
         # Always through ffmpeg (copying whatever the TV takes): yt-dlp's raw MPEG-TS played
-        # with audio and video noticeably out of sync on a Samsung, a clean remux does not.
+        # with audio and video noticeably out of sync on a TV in testing, a clean remux does not.
         # It also lets ffmpeg skip ahead for --start, which the buffer cannot.
         return Delivery("stream", reasons)
     if source.via_ytdlp or len(source.inputs) > 1:

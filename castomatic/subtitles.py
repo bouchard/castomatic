@@ -5,7 +5,7 @@ A subtitle is taken from, in order: a file you name, a sidecar file next to the 
 is preferred in each place. Nothing is written to disk: conversion happens in memory
 through ffmpeg.
 
-HLS carries subtitles as WebVTT; DLNA renderers (Samsung) fetch an SRT file.
+HLS carries subtitles as WebVTT; DLNA renderers fetch an SRT file.
 """
 
 import logging

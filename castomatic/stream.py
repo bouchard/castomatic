@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
+from castomatic.backends.base import allow_any_origin
 from castomatic.errors import UserError
 from castomatic.sources import Input
 
@@ -166,19 +167,31 @@ def container_mimes(location: str) -> tuple:
     return CONTAINER_MIMES.get(Path(urlparse(location).path).suffix.lower(), ())
 
 
-def conversion_reasons(summary: Summary, location: str, sink: Set[str]) -> List[str]:
-    """Why this source cannot be sent to the renderer as it is; empty means it can."""
+def conversion_reasons(
+    summary: Summary,
+    location: str,
+    sink: Set[str],
+    video_ok: Optional[Set[str]] = None,
+    audio_ok: Optional[Set[str]] = None,
+) -> List[str]:
+    """Why this source cannot be sent to the renderer as it is; empty means it can.
+
+    ``video_ok`` and ``audio_ok`` are the codecs the TV decodes (a :class:`Capabilities`'
+    ``video`` and ``audio``); by default, what DLNA renderers generally play.
+    """
     sink = sink or DEFAULT_SINK
+    video_ok = video_ok or DIRECT_VIDEO
+    audio_ok = audio_ok or AUDIO_COPY
     reasons = []
     mimes = container_mimes(location)
     if not any(m in sink for m in mimes):
         suffix = Path(urlparse(location).path).suffix or "this container"
         reasons.append(f"the TV does not list {suffix} files")
-    if summary.video_codec not in DIRECT_VIDEO:
+    if summary.video_codec not in video_ok:
         reasons.append(f"video is {summary.video_codec}")
     elif summary.pix_fmt not in OK_PIXEL_FORMATS.get(summary.video_codec, {summary.pix_fmt}):
         reasons.append(f"video is {summary.pix_fmt} {summary.video_codec}")
-    if summary.audio_codec and summary.audio_codec not in AUDIO_COPY:
+    if summary.audio_codec and summary.audio_codec not in audio_ok:
         reasons.append(f"audio is {summary.audio_codec}")
     return reasons
 
@@ -208,14 +221,26 @@ class StreamPlan:
         return f"{video}, {audio}"
 
 
-def make_plan(inputs: List[Input], summary: Summary, force_convert: bool = False) -> StreamPlan:
-    """Decide stream by stream what can be copied."""
+def make_plan(
+    inputs: List[Input],
+    summary: Summary,
+    force_convert: bool = False,
+    video_ok: Optional[Set[str]] = None,
+    audio_ok: Optional[Set[str]] = None,
+) -> StreamPlan:
+    """Decide stream by stream what can be copied.
+
+    ``video_ok`` / ``audio_ok`` narrow what may be copied to what the TV decodes (by
+    default anything that fits in MPEG-TS); everything else is converted to H.264 / AAC.
+    """
+    video_ok = VIDEO_COPY if video_ok is None else VIDEO_COPY & set(video_ok)
+    audio_ok = AUDIO_COPY if audio_ok is None else AUDIO_COPY & set(audio_ok)
     copy_video = (
         not force_convert
-        and summary.video_codec in VIDEO_COPY
+        and summary.video_codec in video_ok
         and summary.pix_fmt in OK_PIXEL_FORMATS.get(summary.video_codec, {summary.pix_fmt})
     )
-    copy_audio = not force_convert and summary.audio_codec in AUDIO_COPY
+    copy_audio = not force_convert and summary.audio_codec in audio_ok
     return StreamPlan(inputs, summary, copy_video, copy_audio)
 
 
@@ -358,6 +383,7 @@ class StreamServer:
     async def start(self) -> str:
         """Start serving and return the stream URL."""
         app = web.Application()
+        allow_any_origin(app)
         app.router.add_route("*", "/stream.ts", self._stream)
         if self._subtitle is not None:
             self._srt = await self._subtitle.srt(self._start)

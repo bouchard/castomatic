@@ -270,7 +270,7 @@ def test_protocol_choice(the_tv, wanted, expected):
         (tv(dlna_on=False, air=airplay(paired=False)), "auto", "not paired"),
         (tv(dlna_on=False, air=airplay()), "dlna", "did not answer as a DLNA renderer"),
         (tv(), "airplay", "does not offer AirPlay"),
-        (tv(dlna_on=False), "auto", "neither DLNA nor AirPlay"),
+        (tv(dlna_on=False), "auto", "offers no way to play video"),
     ],
 )
 def test_protocol_errors_say_how_to_fix_it(the_tv, wanted, message):

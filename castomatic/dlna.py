@@ -20,6 +20,13 @@ import ifaddr
 from aiohttp import web
 from pathlib import Path
 
+from castomatic.backends.base import (
+    LIVE_MPEGTS,
+    SUBS_SRT,
+    CastError,
+    Capabilities,
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 SSDP_GROUP = ("239.255.255.250", 1900)
@@ -33,18 +40,15 @@ PLAY_WAIT = 15.0
 _DEVICE_NS = {"d": "urn:schemas-upnp-org:device-1-0"}
 _ENDED_STATES = ("STOPPED", "NO_MEDIA_PRESENT")
 _FLAGS = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+# Web-based receivers (Chromecast) fetch media and subtitles from a page on another origin
+CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
 
 
-class DlnaError(Exception):
+class DlnaError(CastError):
     """Raised when the renderer rejects a request or cannot be found.
 
     ``code`` is the UPnP error code when the renderer sent one.
     """
-
-    def __init__(self, message: str, code: Optional[int] = None) -> None:
-        """Initialize a new DlnaError."""
-        super().__init__(message)
-        self.code = code
 
 
 class Renderer:
@@ -100,13 +104,18 @@ def parse_description(location: str, xml_text: str) -> Renderer:
 class _Search(asyncio.DatagramProtocol):
     def __init__(self) -> None:
         self.locations: List[str] = []
+        self.replies: List[Dict[str, str]] = []  # every answer's headers, lower-cased names
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+        headers: Dict[str, str] = {}
         for line in data.decode(errors="replace").split("\r\n"):
-            if line.lower().startswith("location:"):
-                location = line.split(":", 1)[1].strip()
-                if location not in self.locations:
-                    self.locations.append(location)
+            name, sep, value = line.partition(":")
+            if sep:
+                headers[name.strip().lower()] = value.strip()
+        location = headers.get("location")
+        if location and location not in self.locations:
+            self.locations.append(location)
+            self.replies.append(headers)
 
 
 def local_addresses() -> List[str]:
@@ -120,21 +129,29 @@ def local_addresses() -> List[str]:
 
 
 async def ssdp_search(
-    timeout: float = 3.0, target: Tuple[str, int] = SSDP_GROUP
+    timeout: float = 3.0, target: Tuple[str, int] = SSDP_GROUP, st: str = MEDIA_RENDERER
 ) -> List[str]:
     """Return the description URLs of every MediaRenderer that answers an M-SEARCH.
 
     The search is sent from every local interface. A single multicast socket would
     leave through the default route, which on a machine with a VPN or tunnel is often
-    not the LAN.
+    not the LAN. ``st`` is the search target: another device type (``roku:ecp``) finds
+    other devices the same way.
     """
+    return [reply["location"] for reply in await ssdp_replies(timeout, target, st)]
+
+
+async def ssdp_replies(
+    timeout: float = 3.0, target: Tuple[str, int] = SSDP_GROUP, st: str = MEDIA_RENDERER
+) -> List[Dict[str, str]]:
+    """Like :func:`ssdp_search`, but every answer's headers (``location``, ``usn``, ...)."""
     loop = asyncio.get_running_loop()
     message = (
         "M-SEARCH * HTTP/1.1\r\n"
         f"HOST: {SSDP_GROUP[0]}:{SSDP_GROUP[1]}\r\n"
         'MAN: "ssdp:discover"\r\n'
         f"MX: {max(1, int(timeout))}\r\n"
-        f"ST: {MEDIA_RENDERER}\r\n\r\n"
+        f"ST: {st}\r\n\r\n"
     ).encode()
     endpoints = []
     for address in local_addresses():
@@ -151,10 +168,14 @@ async def ssdp_search(
         endpoints.append((transport, protocol))
     try:
         await asyncio.sleep(timeout)
-        locations: List[str] = []
+        replies: List[Dict[str, str]] = []
+        seen: Set[str] = set()
         for _, protocol in endpoints:
-            locations += [loc for loc in protocol.locations if loc not in locations]
-        return locations
+            for reply in protocol.replies:
+                if reply["location"] not in seen:
+                    seen.add(reply["location"])
+                    replies.append(reply)
+        return replies
     finally:
         for transport, _ in endpoints:
             transport.close()
@@ -206,8 +227,9 @@ def didl(
 ) -> str:
     """Build the DIDL-Lite metadata describing the item.
 
-    A subtitle is announced the way Samsung renderers read it (``sec:CaptionInfoEx``)
-    and as a second ``res`` of type ``text/srt`` for other renderers.
+    A subtitle is announced both as a second ``res`` of type ``text/srt`` (the standard
+    way) and as ``sec:CaptionInfoEx``, a widely read extension. A renderer ignores the one
+    it does not know, so no renderer is singled out.
     """
     caption = ""
     if subtitle_url:
@@ -346,6 +368,23 @@ class DlnaPlayer:
         """Whether the renderer lists an HLS media type among what it can play."""
         return any("mpegurl" in mime for mime in await self.sink_types())
 
+    async def capabilities(self) -> Capabilities:
+        """What the renderer says it plays (GetProtocolInfo), as :class:`Capabilities`."""
+        from castomatic import stream  # stream imports this module's neighbours
+
+        sink = frozenset(await self.sink_types())
+        return Capabilities(
+            sink=sink,
+            video=frozenset(stream.DIRECT_VIDEO),
+            audio=frozenset(stream.AUDIO_COPY),
+            hls=any("mpegurl" in m for m in sink),
+            live=LIVE_MPEGTS,
+            subtitles=SUBS_SRT,
+            https=False,
+            live_video=frozenset(stream.VIDEO_COPY),
+            live_audio=frozenset(stream.AUDIO_COPY),
+        )
+
     async def state(self) -> str:
         """The renderer's transport state, e.g. PLAYING or TRANSITIONING."""
         return await self._state()
@@ -448,8 +487,10 @@ def guess_mime(path: Path) -> str:
 class DirectFileServer:
     """Serve one file unchanged, with Range support, for renderers that play it as is.
 
-    An optional subtitle is served as ``/subs.srt`` and announced to the renderer in
-    the ``CaptionInfo.sec`` header (what Samsung renderers ask for).
+    An optional subtitle is served as ``/subs.srt`` (or ``/subs.vtt`` with
+    ``subtitle_format="webvtt"``) and also announced in the ``CaptionInfo.sec`` header,
+    an extension some renderers read and the rest ignore. Every response allows any
+    origin (CORS), which web-based receivers such as Chromecast require.
     """
 
     def __init__(
@@ -459,6 +500,7 @@ class DirectFileServer:
         port: int = 0,
         subtitle: Any = None,
         respond: Optional[Callable[..., Awaitable[web.StreamResponse]]] = None,
+        subtitle_format: str = "srt",
     ) -> None:
         """Initialize a new DirectFileServer.
 
@@ -470,6 +512,7 @@ class DirectFileServer:
         self._address = address
         self._port = port
         self._subtitle = subtitle
+        self._subtitle_format = subtitle_format
         self._srt = b""
         self._runner: Optional[web.AppRunner] = None
         self.subtitle_url: Optional[str] = None
@@ -481,12 +524,13 @@ class DirectFileServer:
             "%s %s from %s headers=%s", request.method, request.path, request.remote,
             dict(request.headers),
         )  # fmt: skip
-        # Renderers ask for these with "getcontentFeatures.dlna.org: 1" and some
-        # (Samsung) wait forever without an answer
+        # Renderers ask for these with "getcontentFeatures.dlna.org: 1" and some wait
+        # forever without an answer
         headers = {
             "transferMode.dlna.org": "Streaming",
             "contentFeatures.dlna.org": _FLAGS,
             "Accept-Ranges": "bytes",
+            **CORS_HEADERS,
         }
         if self.subtitle_url:
             headers["CaptionInfo.sec"] = self.subtitle_url
@@ -496,15 +540,22 @@ class DirectFileServer:
 
     async def _serve_subtitle(self, request: web.Request) -> web.Response:
         _LOGGER.debug("subtitle requested by %s", request.remote)
-        return web.Response(body=self._srt, content_type="text/srt", charset="utf-8")
+        kind = "text/vtt" if self._subtitle_format == "webvtt" else "text/srt"
+        return web.Response(
+            body=self._srt, content_type=kind, charset="utf-8", headers=CORS_HEADERS
+        )
 
     async def start(self) -> str:
         """Start serving and return the file's URL."""
         app = web.Application()
         app.router.add_route("*", "/media{ext:\\.[A-Za-z0-9]+}", self._serve)
+        name = "subs.vtt" if self._subtitle_format == "webvtt" else "subs.srt"
         if self._subtitle is not None:
-            self._srt = await self._subtitle.srt()
-            app.router.add_get("/subs.srt", self._serve_subtitle)
+            if self._subtitle_format == "webvtt":
+                self._srt = await self._subtitle.webvtt()
+            else:
+                self._srt = await self._subtitle.srt()
+            app.router.add_get(f"/{name}", self._serve_subtitle)
         # A request waiting on a slow drive must not hold up stopping
         self._runner = web.AppRunner(app, access_log=None, shutdown_timeout=1.0)
         await self._runner.setup()
@@ -513,7 +564,7 @@ class DirectFileServer:
         port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
         base = f"http://{self._address}:{port}"
         if self._subtitle is not None:
-            self.subtitle_url = f"{base}/subs.srt"
+            self.subtitle_url = f"{base}/{name}"
         return f"{base}/media{self._path.suffix or '.mp4'}"
 
     async def stop(self) -> None:

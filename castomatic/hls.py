@@ -15,6 +15,8 @@ from typing import Any, List, Optional, Tuple, Union
 
 from aiohttp import web
 
+from castomatic.backends.base import allow_any_origin
+
 _LOGGER = logging.getLogger(__name__)
 
 PLAYLIST_NAME = "index.m3u8"
@@ -60,7 +62,7 @@ class MediaPlan:
     def playable_start(self, seconds: float) -> float:
         """``seconds``, moved off the very start of a segment.
 
-        Asked to start exactly where a segment begins, a receiver (Samsung over AirPlay)
+        Asked to start exactly where a segment begins, some receivers
         can fetch that segment over and over without ever playing it.
         """
         for seg in self.segments:
@@ -404,6 +406,7 @@ class JitHlsServer:
             return await _log_requests(request, handler)
 
         app = web.Application(middlewares=[count])
+        allow_any_origin(app)
         app.router.add_get(f"/{PLAYLIST_NAME}", self._playlist)
         if self._media.subtitle:
             app.router.add_get(f"/{MASTER_NAME}", self._master)
@@ -459,8 +462,10 @@ class StaticHlsServer:
         self._address = address
         self._port = port
         self._runner: Optional[web.AppRunner] = None
+        self.requests = 0  # what the receiver asked for: 0 means it never connected
 
     async def _serve(self, request: web.Request) -> web.StreamResponse:
+        self.requests += 1
         root = self._playlist.parent.resolve()
         path = (root / request.match_info["name"]).resolve()
         if root not in path.parents or not path.is_file():
@@ -471,7 +476,8 @@ class StaticHlsServer:
 
     async def start(self) -> str:
         """Start serving and return the playlist URL."""
-        app = web.Application()
+        app = web.Application(middlewares=[_log_requests])
+        allow_any_origin(app)
         app.router.add_get("/{name:.+}", self._serve)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
