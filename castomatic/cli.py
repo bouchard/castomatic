@@ -81,6 +81,7 @@ class StartFailed(Exception):
         self.hint = hint
         self.fetched = fetched  # the TV did ask this computer for the video
         self.untouched = untouched  # the video was being sent as it is
+        self.no_picture = False  # it played, but showed no picture
 
     def as_user_error(self) -> UserError:
         """For when nothing is left to try."""
@@ -160,12 +161,13 @@ FIREWALL_HINT = (
 
 
 async def _watch_start(
-    player: Any, server: Any, tv_name: str, failover: bool = False
+    player: Any, server: Any, tv_name: str, failover: bool = False, picture: bool = False
 ) -> Optional[StartFailed]:
     """If the TV has not started playing after a while, say why that usually is.
 
     With ``failover``, nothing is printed: the reason is returned so the caller can try
-    another way instead.
+    another way instead. With ``picture`` (the video is sent without converting it), a TV
+    that can say whether it shows the picture is also asked, once it plays.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + START_WATCH_SECONDS
@@ -173,7 +175,7 @@ async def _watch_start(
         await asyncio.sleep(WATCH_INTERVAL)
         try:
             if await player.state() in ("PLAYING", "PAUSED_PLAYBACK"):
-                return None
+                return await _check_picture(player, tv_name, failover) if picture else None
         except (CastError, aiohttp.ClientError, asyncio.TimeoutError):
             continue
     hits = getattr(server, "requests", None)
@@ -194,6 +196,23 @@ async def _watch_start(
             "'allow' prompt, accept it with the remote.",
             fetched=True,
         )
+    if failover:
+        return failed
+    print()
+    print(f"warning: {failed.reason}\n  hint: {failed.hint}")
+    return None
+
+
+async def _check_picture(player: Any, tv_name: str, failover: bool) -> Optional[StartFailed]:
+    """A failure if the TV plays the video but shows no picture (it cannot decode it)."""
+    if not hasattr(player, "shows_picture") or await player.shows_picture() is not False:
+        return None
+    failed = StartFailed(
+        f"{tv_name} is playing the sound but showing no picture: it cannot decode this video.",
+        "Try `--mode convert`.",
+        fetched=True,
+    )
+    failed.no_picture = True
     if failover:
         return failed
     print()
@@ -336,12 +355,17 @@ async def _play_renderer(
 
         shift = await start_playing(args.start)
         watch = None if buffered else fallback
+        copied = _copies_video(delivery, summary, caps)
         try:
             reached = await _wait(
-                player, server, tv.name, source, summary, args, buffered, shift, watch
-            )
+                player, server, tv.name, source, summary, args, buffered, shift, watch,
+                picture=copied,
+            )  # fmt: skip
         except StartFailed as ex:
             ex.untouched = delivery.untouched
+            if ex.no_picture and hasattr(player, "remember_cannot_show"):
+                player.remember_cannot_show(summary.video_codec)
+                ex.untouched = True  # the video went as it is: try again converting it
             raise
         if reached is not None:
             buffered = fallback.media
@@ -366,6 +390,15 @@ async def _play_renderer(
             print(f"\nffmpeg reported: {server.last_error}")
 
 
+def _copies_video(delivery: Delivery, summary: stream.Summary, caps: Capabilities) -> bool:
+    """Whether the TV is sent the video's own picture data, not a conversion of it."""
+    if delivery.untouched:
+        return True
+    if delivery.kind == "hls" and caps.live != planner.LIVE_HLS:
+        return summary.video_codec in hls.DEFAULT_VIDEO_COPY  # what _prepare_dlna copies
+    return delivery.kind in ("hls", "live") and summary.video_codec in caps.live_video
+
+
 async def _prepare_dlna(
     args, source, summary, delivery, sink, sub, player, workdir, buffered=None, caps=None, burn=None
 ):
@@ -388,7 +421,12 @@ async def _prepare_dlna(
         return await server.start(), server, HLS_MIME, args.start
     if kind == "hls":
         sub = await _check_subtitle(sub, "webvtt")
-        media = await (buffered.plan(sub, _print_progress) if buffered else hls.plan(source.path, sub))
+        copy = {}
+        if caps is not None and caps.live == planner.LIVE_HLS:  # players built around HLS
+            copy = {"video_ok": caps.live_video, "audio_ok": caps.live_audio}
+        media = await (
+            buffered.plan(sub, _print_progress, **copy) if buffered else hls.plan(source.path, sub, **copy)
+        )
         url, server = await _hls_server(args, media, ip, workdir)
         return url, server, HLS_MIME, media.playable_start(args.start)
     if kind == "live":  # HLS written as ffmpeg goes: what Chromecast and Roku play best
@@ -576,13 +614,17 @@ async def _watch_direct(player, fallback, start: float, shift: float) -> Optiona
 
 
 async def _wait(
-    player, server, tv_name, source, summary, args, buffered=None, shift=0.0, watch=None
+    player, server, tv_name, source, summary, args, buffered=None, shift=0.0, watch=None,
+    picture=False,
 ) -> Optional[float]:
-    """Wait for the end. With ``watch``, returns the time reached if a switch is needed."""
+    """Wait for the end. With ``watch``, returns the time reached if a switch is needed.
+
+    ``picture``: the video is sent without converting it, so check the TV shows it.
+    """
     duration = summary.duration or source.duration
     failover = getattr(args, "failover", False)
     ticker = asyncio.ensure_future(_ticker(time.monotonic(), duration))
-    watcher = asyncio.ensure_future(_watch_start(player, server, tv_name, failover))
+    watcher = asyncio.ensure_future(_watch_start(player, server, tv_name, failover, picture))
     try:
         if failover:
             failed = await _first_verdict(player, watcher, tv_name)

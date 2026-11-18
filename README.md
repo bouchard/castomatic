@@ -41,6 +41,9 @@ castomatic doctor        # checks everything, finds your TVs, says what to fix
 castomatic movie.mkv     # play something
 ```
 
+To run it straight from this folder without installing, use `./castomatic.sh`, which runs it
+with uv (from any directory, so it can be linked onto your PATH).
+
 The first run explains itself. In short:
 
 1. Turn the TV on and leave it on its home screen.

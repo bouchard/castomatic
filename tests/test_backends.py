@@ -1,6 +1,7 @@
 """Chromecast and Roku players and discovery, against fakes that behave like the real thing."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import aiohttp
@@ -159,6 +160,20 @@ async def test_chromecast_error_ends_playback_with_a_reason(cast_player):
     FakeCattDevice.last._cast.media_controller.status = status("IDLE", 0.0, "ERROR")
     await asyncio.wait_for(cast_player.wait_until_ended(), 1)
     assert "error" in cast_player.error
+    await cast_player.close()
+
+
+async def test_chromecast_says_why_playback_ended(cast_player, caplog):
+    # A receiver that drops the session mid-way used to end playback without a word
+    caplog.set_level(logging.DEBUG, logger="castomatic.backends.chromecast")
+    await cast_player.connect()
+    await cast_player.play("http://x/a.mp4")
+    controller = FakeCattDevice.last._cast.media_controller
+    controller.status = status("PLAYING", 60.0)
+    await asyncio.sleep(0.05)
+    controller.status = status("IDLE", 67.0, "INTERRUPTED")
+    await asyncio.wait_for(cast_player.wait_until_ended(), 1)
+    assert "idle reason INTERRUPTED" in caplog.text and cast_player.error is None
     await cast_player.close()
 
 
@@ -434,3 +449,78 @@ async def _ok(value):
 def test_ms_parsing():
     assert roku._ms("2500 ms") == 2.5
     assert roku._ms(None) is None and roku._ms("") is None
+
+
+# -- Chromecast: does it show the picture? ------------------------------------------------------
+
+
+class ListeningCast(FakeCast):
+    """A cast that takes extra namespace handlers, as pychromecast's does."""
+
+    def __init__(self):
+        super().__init__()
+        self.handlers = []
+        self.media_controller.update_status = lambda: self.media_controller.calls.append("update")
+
+    def register_handler(self, handler):
+        self.handlers.append(handler)
+
+
+class ListeningDevice(FakeCattDevice):
+    def __init__(self, ip_addr="", lazy=False):
+        super().__init__(ip_addr, lazy)
+        self._cast = ListeningCast()
+        self._controller = FakeController(self._cast)
+
+
+@pytest.fixture
+def listening_player(monkeypatch):
+    monkeypatch.setattr(chromecast, "PICTURE_WAIT", 0.2)
+    info = chromecast.ChromecastInfo("Den TV", "127.0.0.1", uuid="abc")
+    return chromecast.ChromecastPlayer(info, device_factory=ListeningDevice)
+
+
+def media_status(video_info=None):
+    entry = {"playerState": "PLAYING"}
+    if video_info:
+        entry["videoInfo"] = video_info
+    return {"type": "MEDIA_STATUS", "status": [entry]}
+
+
+async def test_chromecast_tries_hevc_until_a_device_does_not_show_it(listening_player):
+    assert "hevc" in (await listening_player.capabilities()).video
+    listening_player.remember_cannot_show("mpeg4")  # never tried as it is: nothing to remember
+    assert await listening_player.capabilities() == chromecast.CAPABILITIES
+    listening_player.remember_cannot_show("hevc")
+    caps = await listening_player.capabilities()
+    assert "hevc" not in caps.video and "hevc" not in caps.live_video and "h264" in caps.video
+    other = chromecast.ChromecastPlayer(chromecast.ChromecastInfo("Other", "10.0.0.9"))
+    assert other.device_id == "chromecast:10.0.0.9"  # no uuid: remembered by address
+    assert "hevc" in (await other.capabilities()).video
+
+
+async def test_chromecast_sees_the_picture_size_it_reports(listening_player):
+    await listening_player.connect()
+    (listener,) = listening_player._device._cast.handlers
+    assert listener.namespace == chromecast.MEDIA_NAMESPACE
+    assert listener.receive_message(None, {"type": "RECEIVER_STATUS"}) is False
+    listener.receive_message(None, media_status())
+    assert listener.video_info is None
+    listener.receive_message(None, media_status({"width": 1920, "height": 1080}))
+    assert await listening_player.shows_picture() is True
+    await listening_player.play("http://x/v.m3u8")  # a new video: nothing known about it yet
+    assert listener.video_info is None
+
+
+async def test_chromecast_playing_sound_without_a_picture(listening_player):
+    await listening_player.connect()
+    assert await listening_player.shows_picture() is False
+    assert "update" in listening_player._device._cast.media_controller.calls  # it asked once
+    listening_player._picture.video_info = {"width": 0}
+    assert await listening_player.shows_picture() is False
+
+
+async def test_chromecast_that_cannot_say_whether_it_shows_the_picture(cast_player):
+    await cast_player.connect()  # this cast takes no extra handlers
+    assert cast_player._picture is None
+    assert await cast_player.shows_picture() is None

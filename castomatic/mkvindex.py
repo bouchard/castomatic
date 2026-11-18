@@ -175,8 +175,8 @@ def _video_track(read_at: ReadAt, where: Optional[Tuple[int, int]]) -> Optional[
 def parse_cues(data: bytes, segment: int, scale: int, track: int) -> Mp4Index:
     """Turn a Cues payload into the keyframes of ``track``.
 
-    Matroska stores no decode times, so they are given as the presentation times. Those
-    only differ by the few frames B-frames reorder, and only copied H.264 is cut on them.
+    Matroska stores no decode times, so they are given as the presentation times;
+    :func:`castomatic.hls.plan` works out the real ones from the stream's reorder delay.
     """
     frames: List[Tuple[float, float, int]] = []
     for element, start, end in _children(data, 0, len(data)):

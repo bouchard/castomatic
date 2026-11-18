@@ -92,3 +92,31 @@ def test_forget_with_only_a_legacy_config(monkeypatch, tmp_path):
     legacy.write_text(json.dumps({"tv": {"name": "Old", "host": "10.0.0.9"}}))
     assert config.forget_tv() is True
     assert config.saved_tv() is None
+
+
+def test_codecs_a_tv_did_not_show_are_remembered_per_device():
+    from castomatic import config
+
+    assert config.cannot_show("chromecast:a") == frozenset()
+    config.remember_cannot_show("chromecast:a", "hevc")
+    config.remember_cannot_show("chromecast:a", "hevc")
+    config.save_tv({"name": "Den", "host": "1.2.3.4"})  # other settings are kept alongside
+    assert config.cannot_show("chromecast:a") == {"hevc"}
+    assert config.cannot_show("chromecast:b") == frozenset()
+    assert config.saved_tv()["host"] == "1.2.3.4"
+
+
+def test_damaged_device_memory_is_ignored_and_replaced():
+    import json
+
+    from castomatic import config
+
+    path = config.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"devices": {"x": "junk", "y": {"cannot_show": ["hevc", 3]}}}))
+    assert config.cannot_show("x") == frozenset() and config.cannot_show("y") == {"hevc"}
+    config.remember_cannot_show("x", "hevc")
+    assert config.cannot_show("x") == {"hevc"}
+    path.write_text(json.dumps({"devices": []}))
+    config.remember_cannot_show("z", "hevc")
+    assert config.cannot_show("z") == {"hevc"}

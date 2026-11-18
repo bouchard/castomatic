@@ -651,3 +651,93 @@ async def test_burning_over_dlna_uses_the_mpegts_stream(caps_player, monkeypatch
     await cli._play_renderer(parse("/m/a.mp4", "--burn-subtitles"), src, summary(), Target(every_way_tv(), "dlna"), tmp_path, None, None, caps_player(None))
     assert caps_player.last.played["url"].endswith("/stream.ts")
     assert "subtitles drawn on" in capsys.readouterr().out
+
+
+# -- a TV that plays the sound but shows no picture ------------------------------------------
+
+
+class PicturePlayer(CapsPlayer):
+    """A Chromecast-like player that says whether it shows the picture, and keeps playing."""
+
+    picture = False
+    forgotten: list = []
+
+    async def play(self, url, title="", start=0.0, subtitle_url=None):
+        self.played = {"url": url, "title": title, "start": start, "subtitle_url": subtitle_url}
+
+    async def shows_picture(self):
+        return self.picture
+
+    def remember_cannot_show(self, codec):
+        self.forgotten.append(codec)
+
+
+async def test_check_picture_only_fails_a_tv_that_says_no(capsys):
+    plain = SimpleNamespace()
+    assert await cli._check_picture(plain, "Den", failover=True) is None  # it cannot say
+    yes = PicturePlayer(None)
+    yes.picture = True
+    assert await cli._check_picture(yes, "Den", failover=True) is None
+    assert await cli._check_picture(SimpleNamespace(shows_picture=lambda: _value(None)), "Den", True) is None
+    failed = await cli._check_picture(PicturePlayer(None), "Den", failover=True)
+    assert failed.no_picture and failed.fetched and "showing no picture" in failed.reason
+    assert capsys.readouterr().out == ""
+    assert await cli._check_picture(PicturePlayer(None), "Den", failover=False) is None
+    out = capsys.readouterr().out
+    assert "warning: Den is playing the sound but showing no picture" in out and "--mode convert" in out
+
+
+async def test_the_picture_is_checked_once_playing_only_when_asked(caps_player, monkeypatch):
+    monkeypatch.setattr(PicturePlayer, "states", ["TRANSITIONING", "PLAYING"])
+    failed = await cli._watch_start(PicturePlayer(None), None, "Den", failover=True, picture=True)
+    assert failed.no_picture
+    monkeypatch.setattr(PicturePlayer, "states", ["PLAYING"])
+    assert await cli._watch_start(PicturePlayer(None), None, "Den", failover=True) is None
+
+
+@pytest.mark.parametrize(
+    "kind,video,live,expected",
+    [
+        ("file", "mpeg2video", planner.LIVE_HLS, True),  # untouched: always its own picture
+        ("hls", "hevc", planner.LIVE_HLS, True),  # a player built around HLS copies what it takes
+        ("hls", "mpeg2video", planner.LIVE_HLS, False),
+        ("live", "h264", planner.LIVE_HLS, True),
+        ("stream", "h264", planner.LIVE_HLS, False),
+        ("hls", "h264", "mpegts", True),  # DLNA: H.264 is copied into HLS, nothing else
+        ("hls", "hevc", "mpegts", False),
+    ],
+)
+def test_copies_video_says_when_the_tv_gets_the_source_picture(kind, video, live, expected):
+    from dataclasses import replace
+
+    caps = replace(chromecast.CAPABILITIES, live=live)
+    delivery = planner.Delivery(kind, [])
+    assert cli._copies_video(delivery, summary(video=video), caps) is expected
+
+
+async def test_no_picture_is_remembered_and_retried_converted(caps_player, monkeypatch):
+    monkeypatch.setattr(PicturePlayer, "forgotten", [])
+    monkeypatch.setattr(PicturePlayer, "picture", False)
+    args = parse("https://h/a.mp4")
+    args.failover = True
+    src = MediaSource("a", [Input("https://h/a.mp4")])
+    with pytest.raises(cli.StartFailed, match="no picture") as caught:
+        await cli._play_renderer(args, src, summary(video="hevc"), Target(every_way_tv(), "chromecast"), None, None, None, PicturePlayer(None))
+    assert caught.value.untouched and caught.value.no_picture  # so failover converts next
+    assert PicturePlayer.forgotten == ["hevc"]
+    assert PicturePlayer.last.calls[-2:] == ["stop", "close"]
+
+
+@needs_ffmpeg
+async def test_a_tv_built_around_hls_gets_copied_hevc_as_fmp4_segments(caps_player, tmp_path, capsys):
+    video = tmp_path / "Show.mkv"
+    _make_video(video, "libx265", "ac3")
+    src = MediaSource("Show", [Input(str(video))], video)
+    summ = stream.summarize([await stream.probe_input(src.inputs[0])])
+    player = caps_player(None)
+    await cli._play_renderer(
+        parse(str(video), "--no-subtitles"), src, summ, Target(every_way_tv(), "chromecast"),
+        None, None, None, player,
+    )  # fmt: skip
+    assert player.played["url"].endswith("/index.m3u8") and player.mime == cli.HLS_MIME
+    assert "Converting to HLS as the TV asks" in capsys.readouterr().out

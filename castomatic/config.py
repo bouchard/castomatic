@@ -1,14 +1,16 @@
 """Remembered settings, kept in ``~/.config/castomatic/config.json``.
 
-Only the chosen TV is stored (its name and where to find it). Pairing credentials stay in
-pyatv's own storage and are never copied here.
+Stored: the chosen TV (its name and where to find it), and which video codecs a TV was
+seen not to show although its protocol allows them (learnt by trying; see
+:mod:`castomatic.backends.chromecast`). Pairing credentials stay in pyatv's own storage and
+are never copied here.
 """
 
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, FrozenSet, Optional
 
 from .errors import UserError
 
@@ -72,6 +74,35 @@ def save_tv(tv: Dict[str, Any]) -> None:
         path.write_text(json.dumps(data, indent=2) + "\n")
     except OSError as ex:
         _LOGGER.warning("could not remember the TV in %s: %s", path, ex)
+
+
+def _write(data: Dict[str, Any]) -> None:
+    path = config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n")
+    except OSError as ex:
+        _LOGGER.warning("could not save %s: %s", path, ex)
+
+
+def cannot_show(device: str) -> FrozenSet[str]:
+    """Video codecs the TV identified by ``device`` was seen not to show."""
+    entry = load().get("devices", {}).get(device, {})
+    codecs = entry.get("cannot_show", []) if isinstance(entry, dict) else []
+    return frozenset(c for c in codecs if isinstance(c, str))
+
+
+def remember_cannot_show(device: str, codec: str) -> None:
+    """Remember that the TV identified by ``device`` does not show ``codec`` video."""
+    data = load()
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        devices = data["devices"] = {}
+    entry = devices.setdefault(device, {})
+    if not isinstance(entry, dict):
+        entry = devices[device] = {}
+    entry["cannot_show"] = sorted(set(entry.get("cannot_show", [])) | {codec})
+    _write(data)
 
 
 def forget_tv() -> bool:

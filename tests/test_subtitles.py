@@ -156,6 +156,19 @@ def test_media_without_subtitles_keeps_the_plain_playlist():
 def test_h264_codec_string():
     assert hls.h264_codec_string("High", 41) == "avc1.640029"
     assert hls.h264_codec_string("Constrained Baseline", 30) == "avc1.42001E"
+
+
+@pytest.mark.parametrize(
+    "profile,level,expected",
+    [
+        ("Main 10", 120, "hvc1.2.4.L120.90"),  # what a Chromecast took for a Main 10 1080p file
+        ("Main", 93, "hvc1.1.6.L93.90"),
+        ("Rext", 150, "hvc1.4.10.L150.90"),
+        (None, None, "hvc1.1.6.L120.90"),
+    ],
+)
+def test_hevc_codec_string(profile, level, expected):
+    assert hls.hevc_codec_string(profile, level) == expected
     assert hls.h264_codec_string("Main", 31) == "avc1.4D001F"
     assert hls.h264_codec_string(None, None) == "avc1.640028"
 

@@ -341,21 +341,22 @@ class BufferedMedia:
         return None
 
     async def plan(
-        self, subtitle: Optional[Any] = None, on_progress: Optional[Status] = None
+        self, subtitle: Optional[Any] = None, on_progress: Optional[Status] = None, **copy: Any
     ) -> "hls.MediaPlan":
         """The HLS plan for the video, readable before the copy is complete if it can be.
 
         With an index, ffmpeg reads the copy through the loopback server. Without one
         the keyframes can only be found by reading the whole file, so the whole copy is
-        made first and reported through ``on_progress``.
+        made first and reported through ``on_progress``. ``copy`` (``video_ok``,
+        ``audio_ok``) is passed on to :func:`castomatic.hls.plan`.
         """
         index = await self.load_index()
         if index is None:
             _LOGGER.info("no keyframe index: copying the whole file before planning")
             await self.cache.wait_complete(on_progress)
-            return await hls.plan(self.cache.path, subtitle)
+            return await hls.plan(self.cache.path, subtitle, **copy)
         source = self.cache.path if self.cache.complete else self.url
-        return await hls.plan(source, subtitle, index=index)
+        return await hls.plan(source, subtitle, index=index, **copy)
 
     def offset_at(self, seconds: float, duration: float) -> int:
         """The file position of ``seconds`` into the video."""

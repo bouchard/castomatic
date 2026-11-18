@@ -8,13 +8,23 @@ media. catt and pychromecast are synchronous, so every call runs in a worker thr
 
 The TV fetches media from this computer over HTTP, so the same local servers as DLNA are
 used (file as it is, just-in-time HLS, live HLS). catt's own file server is not used.
+
+Which video a receiver decodes differs between devices, and a device does not say: every
+generation announces itself only as "Chromecast". So HEVC, which newer receivers decode, is
+tried as it is. A receiver that cannot decode a video still reports PLAYING (with sound, if
+it decodes that), but leaves out the ``videoInfo`` (picture size) it reports for video it
+shows. :meth:`ChromecastPlayer.shows_picture` reads that, and a device seen not to show a
+codec is remembered (:func:`castomatic.config.remember_cannot_show`) and sent it converted
+from then on. Audio has no such signal, so only audio every receiver decodes is sent as it is.
 """
 
 import asyncio
 import logging
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, List, Optional
+
+from castomatic import config
 
 from castomatic.backends.base import (
     LIVE_HLS,
@@ -34,17 +44,22 @@ PORT = 8009
 POLL_INTERVAL = 2.0
 POLL_FAILURES = 5
 PLAY_WAIT = 15.0
-# What every Cast receiver's Default Media Receiver plays, per Google's published list of
-# supported media. Nothing narrower is assumed for any particular device.
+PICTURE_WAIT = 10.0  # seconds of playing before a missing picture counts as none
+MEDIA_NAMESPACE = "urn:x-cast:com.google.cast.media"
+# Video codecs some receivers decode and others do not: tried as they are, then remembered
+# per device if it does not show them
+TRIED_VIDEO = frozenset({"hevc"})
+# What a Cast receiver's Default Media Receiver plays, per Google's published list of
+# supported media, plus TRIED_VIDEO. Nothing is assumed from a device's name or model.
 CAPABILITIES = Capabilities(
     sink=frozenset({"video/mp4", "video/webm"}),
-    video=frozenset({"h264", "vp8", "vp9"}),
+    video=frozenset({"h264", "vp8", "vp9"}) | TRIED_VIDEO,
     audio=frozenset({"aac", "mp3", "opus", "vorbis", "flac"}),
     hls=True,
     live=LIVE_HLS,
     subtitles=SUBS_WEBVTT,
     https=True,
-    live_video=frozenset({"h264"}),
+    live_video=frozenset({"h264"}) | TRIED_VIDEO,
     live_audio=frozenset({"aac", "mp3"}),
 )
 # Cast "audio" devices and speaker groups have no screen
@@ -96,6 +111,30 @@ async def discover(timeout: float = 5.0) -> List[ChromecastInfo]:
     return [c for c in found if c.cast_type in VIDEO_CAST_TYPES]
 
 
+def _picture_listener() -> Any:
+    """A media-namespace handler that records the picture size the receiver reports.
+
+    pychromecast drops ``videoInfo`` from media status messages; this keeps it.
+    """
+    from pychromecast.controllers import BaseController
+
+    class PictureListener(BaseController):
+        """Records ``videoInfo`` from every MEDIA_STATUS message."""
+
+        def __init__(self) -> None:
+            super().__init__(MEDIA_NAMESPACE)
+            self.video_info: Optional[dict] = None
+
+        def receive_message(self, _message: Any, data: dict) -> bool:
+            if data.get("type") == "MEDIA_STATUS":
+                for status in data.get("status") or []:
+                    if status.get("videoInfo"):
+                        self.video_info = status["videoInfo"]
+            return False  # the media controller handles the message as usual
+
+    return PictureListener()
+
+
 def _local_ip_for(host: str) -> str:
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -124,6 +163,7 @@ class ChromecastPlayer:
         self.local_ip = ""
         self._factory = device_factory
         self._device: Any = None
+        self._picture: Any = None  # the PictureListener, once connected
         self._poll: Optional["asyncio.Task[None]"] = None
 
     # -- connection -------------------------------------------------------
@@ -140,6 +180,10 @@ class ChromecastPlayer:
         def open_device() -> Any:
             device = factory(ip_addr=self.info.host, lazy=True)
             device.controller  # connects, and raises if the device does not answer
+            cast = getattr(device, "_cast", None)
+            if cast is not None and hasattr(cast, "register_handler"):
+                self._picture = _picture_listener()
+                cast.register_handler(self._picture)
             return device
 
         try:
@@ -160,9 +204,48 @@ class ChromecastPlayer:
                 _LOGGER.debug("disconnect failed: %s", ex)
         self._device = None
 
+    @property
+    def device_id(self) -> str:
+        """What this device is remembered by."""
+        return f"chromecast:{self.info.uuid or self.info.host}"
+
     async def capabilities(self) -> Capabilities:
-        """What the Default Media Receiver plays."""
-        return CAPABILITIES
+        """What the Default Media Receiver plays, less video this device did not show."""
+        missing = config.cannot_show(self.device_id) & TRIED_VIDEO
+        if not missing:
+            return CAPABILITIES
+        return replace(
+            CAPABILITIES, video=CAPABILITIES.video - missing,
+            live_video=CAPABILITIES.live_video - missing,
+        )  # fmt: skip
+
+    def remember_cannot_show(self, codec: str) -> None:
+        """Send ``codec`` video to this device converted from now on."""
+        if codec in TRIED_VIDEO:
+            _LOGGER.info("%s does not show %s video; remembered", self.info.name, codec)
+            config.remember_cannot_show(self.device_id, codec)
+
+    async def shows_picture(self) -> Optional[bool]:
+        """Whether the receiver shows the video's picture, once it is playing.
+
+        True once it reports a picture size; False if it plays for ``PICTURE_WAIT``
+        seconds without one (it is playing the sound only); None if it cannot be told.
+        """
+        if self._picture is None:
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PICTURE_WAIT
+        asked = False
+        while self._picture.video_info is None:
+            if loop.time() >= deadline:
+                return False
+            if not asked and loop.time() >= deadline - PICTURE_WAIT / 2:
+                asked = True  # status messages may not have come since it started
+                cast = self._cast
+                if cast is not None:
+                    await asyncio.to_thread(cast.media_controller.update_status)
+            await asyncio.sleep(PICTURE_WAIT / 20)
+        return bool(self._picture.video_info.get("width"))
 
     # -- playback ---------------------------------------------------------
 
@@ -179,6 +262,8 @@ class ChromecastPlayer:
             self._poll = None
         self.ended.clear()
         self.error = None
+        if self._picture is not None:
+            self._picture.video_info = None
         controller = self._device.controller
 
         def load() -> None:
@@ -270,6 +355,10 @@ class ChromecastPlayer:
                 self.ended.set()
                 return
             if played and state in (STATE_STOPPED, STATE_NO_MEDIA):
+                _LOGGER.debug(
+                    "receiver %s (idle reason %s, app %s) after playing",
+                    state, reason, getattr(self._cast, "app_display_name", None),
+                )  # fmt: skip
                 self.ended.set()
                 return
             if state == STATE_STOPPED and reason in ("FINISHED", "CANCELLED", "INTERRUPTED"):
