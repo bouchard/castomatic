@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pyatv
 from pyatv.auth.hap_pairing import HapCredentials, parse_credentials
-from pyatv.const import Protocol
+from pyatv.const import PairingRequirement, Protocol
 from pyatv.storage.file_storage import FileStorage
 
 from castomatic import config, dlna
@@ -55,6 +55,13 @@ class AirPlayInfo:
     port: int
     credentials: Optional[HapCredentials]
     name: str = ""
+    # False when the receiver says no pairing is needed: it then takes classic AirPlay video
+    pairing_needed: bool = True
+
+    @property
+    def usable(self) -> bool:
+        """Whether this machine can play on it: paired, or no pairing needed."""
+        return self.credentials is not None or not self.pairing_needed
 
 
 @dataclass
@@ -85,7 +92,7 @@ class TV:
         for name in PROTOCOLS:
             if not self.offers(name):
                 continue
-            if name == "airplay" and not self.airplay.credentials:
+            if name == "airplay" and not self.airplay.usable:
                 found.append("AirPlay (not paired)")
             else:
                 found.append(LABELS[name])
@@ -142,6 +149,7 @@ async def _scan_airplay(credentials_override: Optional[str]) -> List[AirPlayInfo
             AirPlayInfo(
                 conf.identifier, str(conf.address), service.port,
                 parse_credentials(creds) if creds else None, conf.name,
+                pairing_needed=service.pairing != PairingRequirement.NotNeeded,
             )
         )  # fmt: skip
     return found
@@ -287,7 +295,7 @@ def candidate_targets(tv: TV, wanted: str = "auto") -> List[Target]:
         return [_pick_protocol(tv, wanted)]
     found = [
         Target(tv, name) for name in PROTOCOLS
-        if tv.offers(name) and (name != "airplay" or tv.airplay.credentials)
+        if tv.offers(name) and (name != "airplay" or tv.airplay.usable)
     ]  # fmt: skip
     if found:
         return found
@@ -297,9 +305,9 @@ def candidate_targets(tv: TV, wanted: str = "auto") -> List[Target]:
 def _pick_protocol(tv: TV, wanted: str) -> Target:
     if wanted == "auto":
         for name in PROTOCOLS:
-            if tv.offers(name) and (name != "airplay" or tv.airplay.credentials):
+            if tv.offers(name) and (name != "airplay" or tv.airplay.usable):
                 return Target(tv, name)
-    elif tv.offers(wanted) and (wanted != "airplay" or tv.airplay.credentials):
+    elif tv.offers(wanted) and (wanted != "airplay" or tv.airplay.usable):
         return Target(tv, wanted)
     if wanted in ("auto", "airplay") and tv.airplay:
         others = "" if wanted == "airplay" else (

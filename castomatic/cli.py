@@ -29,6 +29,7 @@ from castomatic import (
 from castomatic.errors import UPNP_HINTS, UserError
 from castomatic.airplay import AirPlayError, AirPlayPlayer
 from castomatic.backends.base import SUBS_NONE, SUBS_WEBVTT, CastError, Capabilities
+from castomatic.backends.airplay_classic import ClassicAirPlayPlayer
 from castomatic.backends.chromecast import ChromecastPlayer
 from castomatic.backends.roku import RokuPlayer
 from castomatic.live import LiveHls
@@ -765,6 +766,10 @@ async def _play_airplay(
 ) -> None:
     tv = target.tv
     info = tv.airplay
+    if info.credentials is None and not info.pairing_needed:  # classic AirPlay: fetches a URL
+        classic = ClassicAirPlayPlayer(info.address, info.port, tv.name)
+        await _play_renderer(args, source, summary, target, workdir, buffered, fallback, classic)
+        return
     player = AirPlayPlayer(info.address, info.port, info.credentials)
     server: Any = None
     live: Optional[LiveHls] = None

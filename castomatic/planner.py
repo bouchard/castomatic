@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 from castomatic import sources, stream
 from castomatic.backends import chromecast as cast_backend
+from castomatic.backends import airplay_classic as classic_backend
 from castomatic.backends import roku as roku_backend
 from castomatic.backends.base import LIVE_HLS, SUBS_NONE, Capabilities  # noqa: F401 (LIVE_HLS re-exported)
 
@@ -148,6 +149,12 @@ def static_capabilities(protocol: str) -> Optional[Capabilities]:
     return {"chromecast": cast_backend.CAPABILITIES, "roku": roku_backend.CAPABILITIES}.get(protocol)
 
 
+def _classic(target: Any) -> bool:
+    """Whether ``target`` is reached by classic AirPlay (no pairing needed, none done)."""
+    info = getattr(target.tv, "airplay", None)
+    return info is not None and info.credentials is None and not info.pairing_needed
+
+
 def seeks(protocol: str) -> bool:
     """Whether the protocol can start a video part way in."""
     return not (protocol == "roku" and not roku_backend.SEEKS)
@@ -195,6 +202,10 @@ async def order_targets(
         if caps is not None and summary is not None:
             delivery = choose_delivery(
                 mode, source, summary, set(), False, caps, start, seeks(target.protocol)
+            )
+        elif target.protocol == "airplay" and summary is not None and _classic(target):
+            delivery = choose_delivery(
+                mode, source, summary, set(), False, classic_backend.CAPABILITIES, start, True
             )
         elif target.protocol == "airplay" and summary is not None:
             delivery = Delivery("static" if source.is_hls_playlist else "hls", [])

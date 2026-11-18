@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
-from pyatv.const import Protocol
+from pyatv.const import PairingRequirement, Protocol
 
 from castomatic import config, dlna, targets
 from castomatic.errors import UserError
@@ -102,9 +102,10 @@ async def test_scan_airplay_reads_names_and_credentials(monkeypatch):
             return self._service
 
     configs = [
-        Conf("Paired", "10.0.0.5", "creds", SimpleNamespace(port=7000)),
-        Conf("Unpaired", "10.0.0.6", None, SimpleNamespace(port=7001)),
+        Conf("Paired", "10.0.0.5", "creds", SimpleNamespace(port=7000, pairing=PairingRequirement.Mandatory)),
+        Conf("Unpaired", "10.0.0.6", None, SimpleNamespace(port=7001, pairing=PairingRequirement.Mandatory)),
         Conf("NoAirPlay", "10.0.0.7", None, None),
+        Conf("Open", "10.0.0.8", None, SimpleNamespace(port=7002, pairing=PairingRequirement.NotNeeded)),
     ]
 
     async def scan(loop, **kwargs):
@@ -114,9 +115,10 @@ async def test_scan_airplay_reads_names_and_credentials(monkeypatch):
     monkeypatch.setattr(targets.FileStorage, "default_storage", staticmethod(lambda loop: Storage()))
     monkeypatch.setattr(targets, "parse_credentials", lambda text: f"parsed:{text}")
     found = await targets._scan_airplay(None)
-    assert [(i.name, i.address, i.port, i.credentials) for i in found] == [
-        ("Paired", "10.0.0.5", 7000, "parsed:creds"),
-        ("Unpaired", "10.0.0.6", 7001, None),
+    assert [(i.name, i.address, i.port, i.credentials, i.usable) for i in found] == [
+        ("Paired", "10.0.0.5", 7000, "parsed:creds", True),
+        ("Unpaired", "10.0.0.6", 7001, None, False),
+        ("Open", "10.0.0.8", 7002, None, True),  # no pairing needed: classic AirPlay
     ]
     override = await targets._scan_airplay("given")
     assert override[1].credentials == "parsed:given"

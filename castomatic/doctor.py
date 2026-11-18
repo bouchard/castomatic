@@ -216,7 +216,7 @@ async def check_tvs(report: Report, credentials: Optional[str] = None) -> List[t
     for tv in tvs:
         mine = "  <- your TV" if saved and targets.matches(tv, saved["host"]) else ""
         report.add(OK, tv.name, f"{tv.host}, {', '.join(tv.protocols)}{mine}")
-        if tv.airplay and not tv.airplay.credentials:
+        if tv.airplay and not tv.airplay.usable:
             others = [p for p in ("chromecast", "dlna", "roku") if tv.offers(p)]
             status = OK if others else WARN
             report.add(
