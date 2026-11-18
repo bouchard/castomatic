@@ -7,6 +7,7 @@ unauthenticated, so nothing needs to be paired.
 """
 
 import asyncio
+import ipaddress
 import logging
 import mimetypes
 import socket
@@ -126,6 +127,32 @@ def local_addresses() -> List[str]:
             if isinstance(ip.ip, str) and not ip.ip.startswith(("127.", "169.254.")):
                 found.append(ip.ip)
     return found
+
+
+def local_networks() -> List[ipaddress.IPv4Network]:
+    """The IPv4 networks this machine's interfaces are directly on (no loopback or link-local).
+
+    A point-to-point tunnel (a VPN's /32) is not a network the TV could be on, so it is skipped.
+    """
+    found = []
+    for adapter in ifaddr.get_adapters():
+        for ip in adapter.ips:
+            if isinstance(ip.ip, str) and not ip.ip.startswith(("127.", "169.254.")):
+                if ip.network_prefix < 32:
+                    found.append(ipaddress.ip_network(f"{ip.ip}/{ip.network_prefix}", strict=False))
+    return found
+
+
+def on_local_network(host: str) -> bool:
+    """Whether ``host`` is on a network this machine is directly on, not reached through a route.
+
+    A name rather than an address cannot be judged without resolving it, so it counts as local.
+    """
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return any(address in network for network in local_networks())
 
 
 async def ssdp_search(

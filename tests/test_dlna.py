@@ -329,6 +329,26 @@ def test_local_addresses_skip_loopback_and_link_local(monkeypatch):
     assert REAL_LOCAL_ADDRESSES() == ["10.0.0.5", "100.64.0.9"]
 
 
+def test_local_networks_skip_tunnels_and_judge_hosts(monkeypatch):
+    import ipaddress
+
+    from tests.conftest import REAL_LOCAL_NETWORKS
+
+    def adapter(*ips):
+        return SimpleNamespace(ips=[SimpleNamespace(ip=ip, network_prefix=n) for ip, n in ips])
+
+    monkeypatch.setattr(
+        dlna.ifaddr, "get_adapters",
+        lambda: [adapter(("127.0.0.1", 8)), adapter(("192.168.68.112", 24), (("fe80::1", 0, 0), 64)),
+                 adapter(("100.105.151.18", 32))],
+    )  # fmt: skip
+    assert REAL_LOCAL_NETWORKS() == [ipaddress.ip_network("192.168.68.0/24")]
+    monkeypatch.setattr(dlna, "local_networks", REAL_LOCAL_NETWORKS)
+    assert dlna.on_local_network("192.168.68.103")
+    assert not dlna.on_local_network("192.168.8.145")  # reachable only through the VPN
+    assert dlna.on_local_network("living-room.local")  # a name: cannot tell, so trusted
+
+
 async def test_ssdp_search_skips_interfaces_it_cannot_bind(monkeypatch):
     transport, _, target = await _responder("http://127.0.0.1:1/dmr")
     # 203.0.113.1 (TEST-NET) is not one of our addresses, so binding to it fails

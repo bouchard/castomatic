@@ -334,10 +334,16 @@ async def _saved_fast_targets(saved: dict, wanted: str) -> List[Target]:
     """Every remembered way to reach the saved TV that still answers, without searching.
 
     AirPlay is never on this path: its port changes between sessions, so it needs a scan.
+    Neither is a TV whose address is not on a network this computer is directly on: it may
+    still answer through a VPN from somewhere else (a TV left at home or on a trip), and
+    casting to a screen in another building is never what was meant. The search decides.
     """
     if wanted == "airplay":
         return []
     host = saved["host"]
+    if not dlna.on_local_network(host):
+        _LOGGER.debug("remembered TV %s is not on this network; searching instead", host)
+        return []
     tv = TV(saved.get("name") or host, host)
     if saved.get("location") and wanted in ("auto", "dlna"):
         try:
@@ -390,11 +396,13 @@ async def resolve_targets(
     elif saved:
         candidates = [tv for tv in tvs if matches(tv, saved["host"])]
         if not candidates:
+            others = "".join(f"\n  --tv '{t.name}'    ({t.host})" for t in tvs)
             raise UserError(
-                f"your TV '{saved.get('name', saved['host'])}' ({saved['host']}) was not found.",
+                f"your TV '{saved.get('name', saved['host'])}' ({saved['host']}) was not found "
+                "on this network.",
                 "Turn it on and make sure it is on this network, or pick another with "
-                "`--choose`. Other TVs seen: "
-                + (", ".join(f"{t.name} ({t.host})" for t in tvs) or "none"),
+                "`--choose` (remembered from then on)"
+                + (f" or just this once with:{others}" if others else ". No other TVs were seen."),
             )
         remember = False
     else:

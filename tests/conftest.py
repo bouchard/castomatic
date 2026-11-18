@@ -43,3 +43,18 @@ def no_real_cast_discovery(monkeypatch):
 
     monkeypatch.setattr(chromecast, "discover", none)
     monkeypatch.setattr(roku, "discover", none)
+
+
+from castomatic import dlna as _dlna  # noqa: E402
+import ipaddress as _ipaddress  # noqa: E402
+
+REAL_LOCAL_NETWORKS = _dlna.local_networks
+
+
+@pytest.fixture(autouse=True)
+def test_networks(monkeypatch):
+    """Tests' TVs live on 10.0.0.0/24 and 127/8, whatever network the machine running them is on."""
+    monkeypatch.setattr(
+        _dlna, "local_networks",
+        lambda: [_ipaddress.ip_network("10.0.0.0/24"), _ipaddress.ip_network("127.0.0.0/8")],
+    )  # fmt: skip

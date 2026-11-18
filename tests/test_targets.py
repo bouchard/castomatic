@@ -192,7 +192,20 @@ async def test_remembered_tv_missing_does_not_silently_switch(monkeypatch):
     _discover(monkeypatch, tv("10.0.0.5", "One"))
     with pytest.raises(UserError, match="'Two' .* was not found") as info:
         await targets.resolve_target(interactive=False)
-    assert "--choose" in info.value.hint and "One (10.0.0.5)" in info.value.hint
+    assert "--choose" in info.value.hint and "--tv 'One'    (10.0.0.5)" in info.value.hint
+
+
+async def test_remembered_tv_on_another_network_is_searched_for_not_used(monkeypatch):
+    # e.g. a Chromecast left at home that still answers through a VPN
+    config.save_tv({"name": "Travel TV", "host": "192.168.8.145", "chromecast": True})
+    _discover(monkeypatch, tv("10.0.0.5", "Fire TV"))
+    with pytest.raises(UserError, match="'Travel TV' .* not found on this network") as info:
+        await targets.resolve_target(interactive=False)
+    assert "--tv 'Fire TV'" in info.value.hint
+    _discover(monkeypatch)
+    with pytest.raises(UserError) as info:
+        await targets.resolve_target(interactive=False)
+    assert "No other TVs were seen" in info.value.hint
 
 
 async def test_choose_ignores_the_remembered_tv(monkeypatch):
