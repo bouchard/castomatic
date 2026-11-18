@@ -67,6 +67,30 @@ async def test_embed_failures_say_why_and_leave_nothing_behind(tmp_path):
     assert list(work.iterdir()) == []
 
 
+def test_copies_left_by_killed_runs_are_swept(tmp_path):
+    import os
+
+    def folder(name, owner=None, age=0.0):
+        path = tmp_path / f"{embed.PREFIX}{name}"
+        path.mkdir()
+        (path / "video.mkv").write_bytes(b"x")
+        if owner is not None:
+            (path / embed.OWNER).write_text(owner)
+        if age:
+            os.utime(path, (os.path.getmtime(path) - age,) * 2)
+        return path
+
+    mine = folder("mine", str(os.getpid()))
+    dead = folder("dead", "999999999")
+    other = folder("other", "1")  # launchd/init: alive, maybe not ours to signal
+    fresh = folder("fresh")
+    stale = folder("stale", "junk", age=2 * embed.ORPHAN_AGE)
+    (tmp_path / "unrelated").mkdir()
+    assert sorted(embed.sweep(str(tmp_path))) == sorted([dead, stale])
+    assert mine.exists() and other.exists() and fresh.exists() and (tmp_path / "unrelated").exists()
+
+
+
 def test_tvs_that_ignore_subtitle_links_are_remembered():
     assert not config.ignores_subtitle_links("dlna:uuid:1")
     config.remember_cannot_show("dlna:uuid:1", "hevc")
