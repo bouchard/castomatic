@@ -105,6 +105,25 @@ def remember_cannot_show(device: str, codec: str) -> None:
     _write(data)
 
 
+def ignores_subtitle_links(device: str) -> bool:
+    """Whether the TV identified by ``device`` was seen to ignore a subtitle file it was offered."""
+    entry = load().get("devices", {}).get(device, {})
+    return isinstance(entry, dict) and entry.get("ignores_subtitle_links") is True
+
+
+def remember_ignores_subtitle_links(device: str) -> None:
+    """Remember that the TV identified by ``device`` does not fetch subtitle files."""
+    data = load()
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        devices = data["devices"] = {}
+    entry = devices.setdefault(device, {})
+    if not isinstance(entry, dict):
+        entry = devices[device] = {}
+    entry["ignores_subtitle_links"] = True
+    _write(data)
+
+
 def forget_tv() -> bool:
     """Remove the remembered TV. Returns whether there was one."""
     data = load()

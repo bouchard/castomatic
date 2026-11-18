@@ -148,7 +148,7 @@ A subtitle is chosen automatically, preferring English, from the first of these 
 | TV | How subtitles are sent |
 | --- | --- |
 | Chromecast | A WebVTT file loaded with the video and switched on |
-| DLNA | An SRT file announced with the video |
+| DLNA | An SRT file announced with the video. A TV that never fetches it gets the subtitles inside the video instead (remembered for next time) |
 | AirPlay | A WebVTT track: choose it in the TV's own subtitle menu |
 | Roku | Roku's media player takes no subtitle file: use `--burn-subtitles` |
 
@@ -248,7 +248,12 @@ from a small server this program runs for the length of playback. The renderer's
    play files but not HLS), copying whichever streams are already supported.
 
 Subtitles go out as an SRT file announced in the DIDL metadata (as a standard `res` and as the
-widely read `CaptionInfo.sec` extension). Every response carries `contentFeatures.dlna.org`,
+widely read `CaptionInfo.sec` extension). Some renderers (AirScreen, for one) fetch the video but
+never the subtitle file. castomatic notices this, remuxes the video into Matroska (or MP4) with the
+subtitles as its default track, nothing re-encoded, and starts the TV again where it was. From
+an internal drive this takes seconds even for a three-hour video, and the result is a plain file
+the TV can seek in. The renderer is remembered, so the next time the subtitles go inside from
+the start. Every response carries `contentFeatures.dlna.org`,
 and a `Stop` is sent before each new item, which some renderers need and the rest ignore.
 
 ### AirPlay 2

@@ -9,6 +9,7 @@ if that one does not start playing.
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import sys
 import tempfile
@@ -22,7 +23,8 @@ import aiohttp
 from pyatv import exceptions as pyatv_exceptions
 
 from castomatic import (
-    banner, buffering, config, dlna, hls, planner, sources, stream, subtitles, targets, ytstream,
+    banner, buffering, config, dlna, embed, hls, planner, sources, stream, subtitles, targets,
+    ytstream,
 )  # fmt: skip
 from castomatic.errors import UPNP_HINTS, UserError
 from castomatic.airplay import AirPlayError, AirPlayPlayer
@@ -52,6 +54,9 @@ START_WATCH_SECONDS = 25.0
 FEED_INTERVAL = 2.0  # seconds between checks of how far ahead the copy is
 RESTARTS = 5  # an AirPlay receiver that drops the video is given it again this often
 WATCH_INTERVAL = 2.0
+# How long after the TV starts fetching the video it has to fetch the subtitle file too,
+# before castomatic decides it ignores subtitle files and puts them inside the video
+SUBTITLE_FETCH_WAIT = 10.0
 EXAMPLES = """\
 examples:
   castomatic movie.mkv                     play a file on your TV
@@ -303,6 +308,8 @@ async def _play_renderer(
         raise UserError(reason, hint) from ex
     server: Any = None
     delivery: Optional[Delivery] = None
+    embedded: Optional[embed.Embedded] = None
+    learning: Optional["asyncio.Future[Optional[embed.Embedded]]"] = None
     try:
         caps = await _capabilities(player)
         sink = set(caps.sink)
@@ -325,6 +332,16 @@ async def _play_renderer(
             print("note: subtitles are not sent while converting live; they are left out.")
             sub = None
         duration = summary.duration or source.duration
+        # A TV that ignores the subtitle file gets them inside the video (a quick remux);
+        # not from a slow drive, which would have to be read end to end first
+        can_embed = (
+            sub is not None and delivery.kind == "file" and not buffered
+            and source.path is not None and hasattr(player, "ignores_subtitle_links")
+        )  # fmt: skip
+        if can_embed and player.ignores_subtitle_links():
+            embedded = await _embed_subtitles(source, sub, sink, duration, progress=True)
+            if embedded:
+                source, sub = _embedded_source(source, embedded), None
 
         async def start_playing(at: float) -> float:
             """Serve the video and start it at ``at`` seconds; returns the renderer's shift."""
@@ -356,11 +373,35 @@ async def _play_renderer(
         shift = await start_playing(args.start)
         watch = None if buffered else fallback
         copied = _copies_video(delivery, summary, caps)
+        if can_embed and embedded is None and hasattr(server, "subtitle_fetched"):
+            learning = asyncio.ensure_future(
+                _embed_if_ignored(player, server, source, sub, sink, duration)
+            )
         try:
-            reached = await _wait(
+            waiting = asyncio.ensure_future(_wait(
                 player, server, tv.name, source, summary, args, buffered, shift, watch,
                 picture=copied,
-            )  # fmt: skip
+            ))  # fmt: skip
+            if learning:
+                await asyncio.wait({waiting, learning}, return_when=asyncio.FIRST_COMPLETED)
+                if not waiting.done() and learning.result() is not None:
+                    embedded = learning.result()
+                    waiting.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await waiting
+                    at = await player.position()
+                    at = args.start if at is None else at + shift
+                    await _hold(player)
+                    await server.stop()
+                    server = None
+                    source, sub = _embedded_source(source, embedded), None
+                    print("Starting again where it was, with the subtitles inside the video.")
+                    shift = await start_playing(at)
+                    waiting = asyncio.ensure_future(_wait(
+                        player, server, tv.name, source, summary, args, None, shift, None,
+                        picture=copied,
+                    ))  # fmt: skip
+            reached = await waiting
         except StartFailed as ex:
             ex.untouched = delivery.untouched
             if ex.no_picture and hasattr(player, "remember_cannot_show"):
@@ -382,12 +423,58 @@ async def _play_renderer(
     except CastError as ex:
         raise explain_dlna_error(ex, tv.name) from ex
     finally:
+        if learning and not learning.done():
+            learning.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await learning
         await player.stop()
         if server:
             await server.stop()
         await player.close()
+        if embedded:
+            embedded.close()
         if server is not None and getattr(server, "last_error", None):
             print(f"\nffmpeg reported: {server.last_error}")
+
+
+def _embedded_source(source: sources.MediaSource, embedded: embed.Embedded) -> sources.MediaSource:
+    """The source, played from the copy with the subtitles inside it."""
+    return replace(source, path=embedded.path, inputs=[sources.Input(str(embedded.path))])
+
+
+async def _embed_subtitles(source, sub, sink, duration, progress: bool = False) -> Optional[embed.Embedded]:
+    """A copy of the video with ``sub`` inside it, or None (with a warning) if it fails."""
+
+    def show(fraction: float) -> None:
+        print(f"\r  Adding the subtitles to the video  {100 * fraction:3.0f}%   ", end="", flush=True)
+
+    try:
+        return await embed.embed(
+            source.path, await sub.srt(), sink, duration, sub.language, show if progress else None
+        )
+    except (embed.EmbedError, RuntimeError, OSError) as ex:
+        print(f"\nwarning: the subtitles could not be put inside the video: {ex}")
+        return None
+    finally:
+        if progress:
+            print()
+
+
+async def _embed_if_ignored(player, server, source, sub, sink, duration) -> Optional[embed.Embedded]:
+    """If the TV fetches the video but not the subtitle file, a copy with them inside.
+
+    The TV is remembered, so next time the subtitles go inside the video from the start.
+    None when the TV fetched the subtitles (or the copy could not be made).
+    """
+    await server.media_fetched.wait()
+    try:
+        await asyncio.wait_for(server.subtitle_fetched.wait(), SUBTITLE_FETCH_WAIT)
+        return None
+    except asyncio.TimeoutError:
+        pass
+    player.remember_ignores_subtitle_links()
+    print("\nnote: the TV did not fetch the subtitle file, so they are being put inside the video ...")
+    return await _embed_subtitles(source, sub, sink, duration)
 
 
 def _copies_video(delivery: Delivery, summary: stream.Summary, caps: Capabilities) -> bool:

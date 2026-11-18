@@ -21,6 +21,7 @@ import ifaddr
 from aiohttp import web
 from pathlib import Path
 
+from castomatic import config
 from castomatic.backends.base import (
     LIVE_MPEGTS,
     SUBS_SRT,
@@ -395,6 +396,20 @@ class DlnaPlayer:
         """Whether the renderer lists an HLS media type among what it can play."""
         return any("mpegurl" in mime for mime in await self.sink_types())
 
+    @property
+    def device_id(self) -> str:
+        """What this renderer is remembered by."""
+        return f"dlna:{self.renderer.udn or self.renderer.host}"
+
+    def ignores_subtitle_links(self) -> bool:
+        """Whether this renderer was seen not to fetch the subtitle file it was offered."""
+        return config.ignores_subtitle_links(self.device_id)
+
+    def remember_ignores_subtitle_links(self) -> None:
+        """Put the subtitles inside the video for this renderer from now on."""
+        _LOGGER.info("%s did not fetch the subtitle file; remembered", self.renderer.friendly_name)
+        config.remember_ignores_subtitle_links(self.device_id)
+
     async def capabilities(self) -> Capabilities:
         """What the renderer says it plays (GetProtocolInfo), as :class:`Capabilities`."""
         from castomatic import stream  # stream imports this module's neighbours
@@ -544,9 +559,12 @@ class DirectFileServer:
         self._runner: Optional[web.AppRunner] = None
         self.subtitle_url: Optional[str] = None
         self.requests = 0  # what the renderer asked for: 0 means it never connected
+        self.media_fetched = asyncio.Event()
+        self.subtitle_fetched = asyncio.Event()
 
     async def _serve(self, request: web.Request) -> web.StreamResponse:
         self.requests += 1
+        self.media_fetched.set()
         _LOGGER.debug(
             "%s %s from %s headers=%s", request.method, request.path, request.remote,
             dict(request.headers),
@@ -567,6 +585,7 @@ class DirectFileServer:
 
     async def _serve_subtitle(self, request: web.Request) -> web.Response:
         _LOGGER.debug("subtitle requested by %s", request.remote)
+        self.subtitle_fetched.set()
         kind = "text/vtt" if self._subtitle_format == "webvtt" else "text/srt"
         return web.Response(
             body=self._srt, content_type=kind, charset="utf-8", headers=CORS_HEADERS
