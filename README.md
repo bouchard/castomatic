@@ -7,7 +7,7 @@
 
 <p align="center">
   Play a video file, a video address or a web page on <b>any TV</b>, with one command,<br>
-  over <b>Chromecast</b>, <b>DLNA</b>, <b>Roku</b> or <b>AirPlay 2</b>.
+  over <b>Chromecast</b>, <b>DLNA</b>, <b>Roku</b> or <b>AirPlay</b>.
 </p>
 
 ```sh
@@ -50,7 +50,8 @@ The first run explains itself. In short:
 2. On a Mac, allow the terminal **Local Network** access and Python **incoming connections**
    when macOS asks: the TV fetches the video from this computer.
 3. Some TVs show an "allow this device?" prompt the first time. Accept it with the remote.
-4. Chromecast, DLNA and Roku need no setup. AirPlay needs pairing once (see
+4. Chromecast, DLNA and Roku need no setup, nor does an AirPlay receiver that says it needs no
+   pairing (receiver apps such as AirScreen). Other AirPlay TVs need pairing once (see
    [Troubleshooting](#troubleshooting)). Roku needs **Control by mobile apps** left on.
 
 ## What happens to each kind of source
@@ -77,7 +78,8 @@ automatically if one does not start playing:
    1. **Chromecast**: reports exactly what it is doing, seeks, and takes subtitles.
    2. **DLNA**: needs no pairing and says what it plays.
    3. **Roku**: cannot be told where to start, and takes no subtitle file.
-   4. **AirPlay**: needs pairing, and only takes HLS.
+   4. **AirPlay**: a receiver that needs no pairing is handed the video's address (classic
+      AirPlay: MP4 as it is, anything else as HLS). One that needs pairing takes only HLS.
 
 If the TV fetched an untouched video but never started it, the same way is tried once more with
 the video converted, then the next protocol. `castomatic explain movie.mkv` shows the whole plan
@@ -149,7 +151,7 @@ A subtitle is chosen automatically, preferring English, from the first of these 
 | --- | --- |
 | Chromecast | A WebVTT file loaded with the video and switched on |
 | DLNA | An SRT file announced with the video. A TV that never fetches it gets the subtitles inside the video instead (remembered for next time) |
-| AirPlay | A WebVTT track: choose it in the TV's own subtitle menu |
+| AirPlay | A WebVTT track in the HLS playlist (choose it in the TV's own subtitle menu if it is not shown). An MP4 sent to a receiver needing no pairing gets the subtitles inside it, as classic AirPlay has no subtitle file |
 | Roku | Roku's media player takes no subtitle file: use `--burn-subtitles` |
 
 `--burn-subtitles` needs an ffmpeg built with libass; `castomatic doctor` checks for it. Subtitles
@@ -188,7 +190,8 @@ error: no TV was found on the network.
   allow the terminal Local Network access (System Settings > Privacy & Security).
 - **Roku refuses (HTTP 403).** On the Roku: Settings > System > Advanced system settings >
   Control by mobile apps > Network access: Default.
-- **AirPlay says "not paired".** Pair once with `atvremote --id <id> --protocol airplay pair`
+- **AirPlay says "not paired".** The receiver asks for pairing (one that needs none is used
+  without it). Pair once with `atvremote --id <id> --protocol airplay pair`
   and enter the PIN shown on the TV. Usually not needed: the same TV often answers over DLNA or
   Chromecast too.
 - **A web page will not play.** Update yt-dlp, add `--cookies-from-browser chrome` for sites
@@ -256,9 +259,25 @@ the TV can seek in. The renderer is remembered, so the next time the subtitles g
 the start. Every response carries `contentFeatures.dlna.org`,
 and a `Stop` is sent before each new item, which some renderers need and the rest ignore.
 
+### Classic AirPlay (receivers that need no pairing)
+
+A receiver whose AirPlay service record says no pairing is needed (receiver apps on Android and
+Fire TV such as AirScreen, Apple TVs with pairing switched off) is played the way the first
+AirPlay senders did it, in plain HTTP on the AirPlay port with one `X-Apple-Session-ID`:
+`POST /play` with a binary plist naming the URL, `GET /playback-info` for `readyToPlay`,
+`rate`, `position` and `duration`, `POST /scrub` to seek, `POST /rate` to pause and resume, and
+`POST /stop`. It goes through the same path as DLNA and Chromecast, with what Apple specifies
+for AirPlay video as the capabilities: MP4 and QuickTime files and HLS, H.264 or HEVC, AAC,
+AC-3 or E-AC-3. So an MP4 is sent as it is and an MKV becomes HLS with the video copied.
+
+What real receivers taught it, handled for every receiver alike: a start position in `/play`
+may be ignored, so the start is a seek once the receiver says it is ready; `/playback-info`
+may hang when nothing is playing, so every request has a time limit; the end is `rate` 0 with
+`position` at `duration`, and the report stays that way after a stop.
+
 ### AirPlay 2
 
-Everything runs over one HAP-encrypted RTSP connection, using pyatv's pairing and crypto.
+For receivers that need pairing. Everything runs over one HAP-encrypted RTSP connection, using pyatv's pairing and crypto.
 The flow was captured from a commercial sender talking to a fake receiver:
 
 1. `pair-verify` with your stored credentials.
@@ -350,7 +369,7 @@ await player.wait_until_ended()
 await player.stop(); await server.stop(); await player.close()
 ```
 
-`DlnaPlayer`, `RokuPlayer` and `AirPlayPlayer` work the same way. `castomatic.planner` decides
+`DlnaPlayer`, `RokuPlayer`, `ClassicAirPlayPlayer` and `AirPlayPlayer` work the same way. `castomatic.planner` decides
 how to send a video from a TV's `Capabilities`; see `castomatic/cli.py` for the whole flow.
 
 ## Development
@@ -372,8 +391,9 @@ tiny video and are skipped without it.
 
 ## Limitations
 
-- Tested on real hardware so far: a Samsung TV over DLNA and AirPlay. Chromecast and Roku are
-  built to their published behaviour and tested against fakes. Reports from real devices are
+- Tested on real hardware so far: a Samsung TV over DLNA and AirPlay 2, a Chromecast, and a
+  Fire TV Stick running AirScreen over DLNA and classic AirPlay. Roku is built to its published
+  behaviour and tested against fakes. Reports from real devices are
   welcome.
 - No seeking from the command line while playing (use `--start`), no choice between several
   audio or subtitle tracks, and no DRM.
