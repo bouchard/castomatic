@@ -24,7 +24,7 @@ from pyatv import exceptions as pyatv_exceptions
 
 from castomatic import (
     banner, buffering, config, dlna, embed, hls, planner, sources, stream, subtitles, targets,
-    ytstream,
+    torrent, ytstream,
 )  # fmt: skip
 from castomatic.errors import UPNP_HINTS, UserError
 from castomatic.airplay import AirPlayError, AirPlayPlayer
@@ -144,9 +144,10 @@ async def _subtitle_for(args, source, buffered) -> Optional[Any]:
         return sub
     usable = buffered.subtitle(sub)
     if sub and not usable:
+        when = "once the download has finished" if _external(buffered) else "when it is played from the finished copy"
         print(
             "note: the subtitles inside this video need all of it, so they are left out this "
-            "time; they will be there when it is played from the finished copy."
+            f"time; they will be there {when}."
         )
     return usable
 
@@ -403,6 +404,16 @@ async def _play_renderer(
                         picture=copied,
                     ))  # fmt: skip
             reached = await waiting
+            while reached is not None and buffered is not None and _external(buffered):
+                # The TV gave up waiting for the download: carry on there once it has come
+                print(
+                    f"\n  {tv.name} stopped waiting for the download at {_clock(reached)}; "
+                    "starting it again there once that part has arrived."
+                )
+                await server.stop()
+                server = None
+                shift = await start_playing(reached)
+                reached = await _wait(player, server, tv.name, source, summary, args, buffered, shift)
         except StartFailed as ex:
             ex.untouched = delivery.untouched
             if ex.no_picture and hasattr(player, "remember_cannot_show"):
@@ -615,29 +626,55 @@ def _announce(delivery: Delivery, server: Any) -> None:
         print(f"Converting just in time{suffix}: {what}.")
 
 
-async def _keep_fed(player, buffered, duration: float, shift: float) -> None:
+async def _keep_fed(player, buffered, duration: float, shift: float) -> Optional[float]:
     """Wait for the end, holding the renderer if it gets close to the end of the copy.
 
     Renderers react to an HTTP read that goes quiet in their own ways, many by giving up,
     so it is paused while there is still time. ``shift`` is the video time the renderer's
     position 0 is at (a live stream starts where it was asked to).
+
+    For a download someone else is running, returns the time reached if the renderer gave
+    up waiting for it there, so it can be started again once that part has arrived.
     """
     cache = buffered.cache
+    external = _external(buffered)
     ended = asyncio.ensure_future(player.wait_until_ended())
+    reached: Optional[float] = None
     try:
         while not cache.complete:
             done, _ = await asyncio.wait({ended}, timeout=FEED_INTERVAL)
             if done:
-                return
+                if external and reached is not None and buffered.short_of(reached, duration):
+                    return reached  # it stopped where the download has not got to
+                return None
             seconds = await player.position()
-            offset = cache.position if seconds is None else buffered.offset_at(seconds + shift, duration)
-            if buffered.running_dry(offset, duration) and await _hold(player):
-                await buffered.fill_ahead(offset, duration, _buffer_status)
+            before, reached = reached, (reached if seconds is None else seconds + shift)
+            offset = cache.position if seconds is None else buffered.offset_at(reached, duration)
+            if external and seconds is not None:
+                # A renderer whose position stands still while a read waits for the
+                # download has run out, whatever the sums say
+                stuck = reached == before and cache.waiting_for is not None
+                dry = stuck or buffered.short_of(reached, duration)
+                _LOGGER.debug(
+                    "renderer at %.1fs, %.1fs of video in hand%s", reached,
+                    buffered.seconds_ahead(reached, duration), " (stuck)" if stuck else "",
+                )  # fmt: skip
+            else:
+                dry = buffered.running_dry(offset, duration)
+            if dry and await _hold(player):
+                if external:
+                    print("\n  Paused: the download has not reached this part yet.")
+                    await buffered.fill_ahead(
+                        offset, duration, _status_for(buffered), ahead=buffering.RESUME_SECONDS
+                    )
+                else:
+                    await buffered.fill_ahead(offset, duration, _buffer_status)
                 print("\r  Buffered enough to carry on." + " " * 40)
                 await _release(player)
         await ended
     finally:
         ended.cancel()
+    return None
 
 
 async def _hold(player) -> bool:
@@ -719,8 +756,7 @@ async def _wait(
             if failed:
                 raise failed
         if buffered:  # holding for the drive can take as long as it takes
-            await _keep_fed(player, buffered, duration, shift)
-            return None
+            return await _keep_fed(player, buffered, duration, shift)
         if watch:
             return await _watch_direct(player, watch, args.start, shift)
         limit = (duration - args.start + 30) if duration else None
@@ -955,19 +991,109 @@ def _buffer_status(have: int, need: int, rate: Optional[float]) -> None:
     print(f"\r  Buffering  {size(have)} of {size(need)} needed{speed}{eta}   ", end="", flush=True)
 
 
+def _clock(seconds: float) -> str:
+    """``1:02:03`` or ``2:03``."""
+    whole = int(seconds)
+    hours, rest = divmod(whole, 3600)
+    return f"{hours}:{rest // 60:02d}:{rest % 60:02d}" if hours else f"{rest // 60}:{rest % 60:02d}"
+
+
+def _download_status(download: Any) -> buffering.Status:
+    """Reports waiting for a torrent download to fill in what playback needs next."""
+
+    def show(have: int, need: int, rate: Optional[float]) -> None:
+        size = sources.format_size
+        if download.stalled:
+            speed = ", the download is not moving (paused?)"
+        elif rate:
+            speed = f", downloading at {size(rate)}/s"
+        else:
+            speed = ""
+        print(
+            f"\r  Waiting for the download: {size(have)} of the {size(need)} needed next{speed}   ",
+            end="", flush=True,
+        )  # fmt: skip
+
+    return show
+
+
+def _external(buffered: Any) -> bool:
+    """Whether ``buffered`` is a download someone else is running (a torrent)."""
+    return bool(getattr(buffered, "external", False))
+
+
+def _status_for(buffered: buffering.BufferedMedia) -> buffering.Status:
+    return _download_status(buffered.cache) if _external(buffered) else _buffer_status
+
+
 async def _buffer_gate(
     buffered: buffering.BufferedMedia, start: float, duration: float, opening: bool = False
 ) -> None:
     """Hold playback back until the local copy is far enough ahead that it cannot stall."""
     if buffered.cache.complete:
         return
-    await buffered.wait_ready(start, duration, _buffer_status, opening=opening)
-    print("\r  Buffered enough to play without stopping; the rest keeps copying." + " " * 20)
+    await buffered.wait_ready(start, duration, _status_for(buffered), opening=opening)
+    if _external(buffered):
+        print(
+            f"\r  Enough is here to start; the TV will be paused if the download falls behind."
+            + " " * 30
+        )
+    else:
+        print("\r  Buffered enough to play without stopping; the rest keeps copying." + " " * 20)
+
+
+async def _follow_download(
+    args: argparse.Namespace, source: sources.MediaSource
+) -> "tuple[sources.MediaSource, buffering.BufferedMedia]":
+    """Play a file a torrent client is still downloading: wait for what every player reads
+    first (the start of the file and its index), then read it only where it has finished."""
+    given = Path(args.torrent).expanduser() if getattr(args, "torrent", None) else None
+    if given is not None and not given.is_file():
+        raise UserError(f"--torrent {args.torrent}: no such file.", "Give the path of the .torrent file.")
+    download = torrent.TorrentFile.open(source.path, given, on_note=lambda text: print(f"\nnote: {text}"))
+    try:
+        print(f"Still downloading: {download.describe()}.")
+        if download.layout is None:
+            print("note: no .torrent found for it, so only which parts are written can be checked.")
+        ready = await _wait_for_essentials(download)
+        media = await buffering.BufferedMedia.following(download, ready.index)
+    except BaseException:
+        await download.stop()
+        raise
+    name = torrent.finished_name(source.path)
+    finished = source.path.with_name(name)
+    return replace(
+        source, title=Path(name).stem, path=finished, inputs=[sources.Input(media.url)]
+    ), media
+
+
+async def _wait_for_essentials(download: Any) -> "torrent.Readiness":
+    """Wait, saying what for, until the parts of the file every player reads first are here."""
+    download.start()
+    ready = torrent.readiness(download)
+    said = None
+    while not ready.ready:
+        if ready.missing != said:
+            if said is not None:
+                print()
+            print(f"Cannot start yet. Waiting to download {ready.missing}.")
+            said = ready.missing
+        rate = download.rate
+        state = (
+            "not moving (is it paused?)" if download.stalled
+            else f"{sources.format_size(rate)}/s" if rate else "checking"
+        )  # fmt: skip
+        print(f"\r  {download.describe()}; {state}   ", end="", flush=True)
+        await asyncio.sleep(torrent.POLL_SECONDS)
+        ready = torrent.readiness(download)
+    if said is not None:
+        print("\n  That part is here now.")
+    return ready
 
 
 async def _finish_copy(buffered: buffering.BufferedMedia) -> None:
     """After playing, fetch whatever was skipped, so next time needs nothing from the drive."""
-    if buffered.cache.complete:
+    if buffered.cache.complete or _external(buffered):
         return
     print("Finishing the local copy (Ctrl-C leaves the rest for next time) ...")
     await buffered.finish(_print_progress)
@@ -976,6 +1102,10 @@ async def _finish_copy(buffered: buffering.BufferedMedia) -> None:
 
 def _copy_report(buffered: buffering.BufferedMedia) -> None:
     c = buffered.cache
+    if _external(buffered):
+        if not c.complete:
+            print(f"The download is {c.describe()}.")
+        return
     if c.complete:
         print(f"The local copy is complete: {c.path}")
     else:
@@ -1026,7 +1156,7 @@ async def run(args: argparse.Namespace) -> None:
     if config.is_first_run() and sys.stdout.isatty() and not getattr(args, "quiet", False):
         banner.welcome()
     stream.ensure_ffmpeg()
-
+    args.source = torrent.finished_if_renamed(args.source)  # finished since it was named
     source = await sources.resolve(
         args.source, args.ytdlp_format, args.cookies_from_browser, args.verbose
     )
@@ -1037,6 +1167,20 @@ async def run(args: argparse.Namespace) -> None:
     if args.engine == "castor":
         await _cast_with_castor(args, source)
         return
+    following: Optional[buffering.BufferedMedia] = None
+    if source.is_local and torrent.find_partial(source.path, getattr(args, "torrent", None)):
+        source, following = await _follow_download(args, source)
+    try:
+        await _run_source(args, source, following)
+    finally:
+        if following:  # closed already if playback got going; closing twice is harmless
+            await following.close()
+
+
+async def _run_source(
+    args: argparse.Namespace, source: sources.MediaSource, following: Optional[buffering.BufferedMedia]
+) -> None:
+    """Probe, pick the TV and play ``source`` (``following``: it is still downloading)."""
     # A yt-dlp video is streamed by yt-dlp itself into a local buffer and re-streamed from
     # there; ffmpeg never opens the site's address. --download-first fetches it all instead.
     relay = source.via_ytdlp and not args.download_first
@@ -1084,7 +1228,7 @@ async def run(args: argparse.Namespace) -> None:
     )
     download = must_download or (args.download_first and (remote_for_airplay or source.via_ytdlp))
     workdir = None
-    buffered: Optional[buffering.BufferedMedia] = None
+    buffered: Optional[buffering.BufferedMedia] = following
     fallback: Optional[buffering.Fallback] = None
     feed: Optional[tuple] = None
     if args.workdir and not Path(args.workdir).is_dir():
@@ -1095,7 +1239,7 @@ async def run(args: argparse.Namespace) -> None:
         path = Path(workdir.name) if workdir else None
         if relay:
             source, summary, feed = await _start_relay(args, source, path)
-        if source.is_local and not source.is_hls_playlist and not download:
+        if source.is_local and not source.is_hls_playlist and not download and not following:
             duration = summary.duration or source.duration
             note = lambda text: print(f"note: {text}")  # noqa: E731
             buffered = await buffering.choose(source.path, duration, on_note=note)
@@ -1245,7 +1389,37 @@ async def explain(args: argparse.Namespace) -> None:
     if not args.source:
         raise UserError("nothing to explain.", "Give a video: `castomatic explain movie.mkv`.")
     stream.ensure_ffmpeg()
+    args.source = torrent.finished_if_renamed(args.source)
     source = await sources.resolve(args.source, args.ytdlp_format, args.cookies_from_browser, args.verbose)
+    following = None
+    if source.is_local and torrent.find_partial(source.path, getattr(args, "torrent", None)):
+        given = Path(args.torrent).expanduser() if getattr(args, "torrent", None) else None
+        download = torrent.TorrentFile.open(source.path, given)
+        print(f"Download:  {download.describe()}")
+        print(f"           {torrent.summary_lines(download)[1]}")
+        ready = torrent.readiness(download)
+        if not ready.ready:
+            print(f"Start:     not yet. Waiting to download {ready.missing}")
+            download.close()
+            return
+        following = await buffering.BufferedMedia.following(download, ready.index)
+        name = torrent.finished_name(source.path)
+        source = replace(
+            source, title=Path(name).stem, path=source.path.with_name(name),
+            inputs=[sources.Input(following.url)],
+        )  # fmt: skip
+        print(
+            f"Start:     possible now; playback goes ahead with {buffering.AHEAD_SECONDS:.0f}s of "
+            "video in hand and pauses the TV if the download falls behind"
+        )
+    try:
+        await _explain_source(args, source, following)
+    finally:
+        if following:
+            await following.close()
+
+
+async def _explain_source(args: argparse.Namespace, source: sources.MediaSource, following: Any) -> None:
     found_by = "castor" if source.via_castor else "yt-dlp" if source.via_ytdlp else None
     print(f"Source:    {source.title}" + (f"  (found by {found_by})" if found_by else ""))
     print(f"Where:     {'this computer' if source.is_local else stream.describe(source.inputs[0])}")
@@ -1260,7 +1434,8 @@ async def explain(args: argparse.Namespace) -> None:
         audio = summary.audio_codec or "none"
         length = f"{summary.duration:.0f}s" if summary.duration else "unknown length"
         print(f"Streams:   video {summary.video_codec} ({summary.pix_fmt or '?'}), audio {audio}, {length}")
-    await _explain_speed(source, summary, infos)
+    if not following:
+        await _explain_speed(source, summary, infos)
 
     try:
         found = await targets.resolve_targets(
@@ -1371,6 +1546,11 @@ def build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     play = parser.add_argument_group("playback")
     play.add_argument("--start", type=float, default=0.0, metavar="SECONDS", help="start position")
+    play.add_argument(
+        "--torrent", metavar="FILE",
+        help="the .torrent a file still downloading comes from, to check its pieces (found "
+        "in the torrent client's folder when left out)",
+    )  # fmt: skip
     play.add_argument(
         "--mode", choices=["auto", "direct", "convert"], default="auto",
         help="auto (default) sends the file untouched when the TV can play it and converts "

@@ -58,3 +58,12 @@ def test_networks(monkeypatch):
         _dlna, "local_networks",
         lambda: [_ipaddress.ip_network("10.0.0.0/24"), _ipaddress.ip_network("127.0.0.0/8")],
     )  # fmt: skip
+
+
+@pytest.fixture(autouse=True)
+def no_real_torrent_clients(monkeypatch, tmp_path_factory):
+    """Never look in the real torrent clients' folders for .torrent files."""
+    from castomatic import torrent
+
+    empty = tmp_path_factory.mktemp("torrent-clients")
+    monkeypatch.setattr(torrent, "_client_folders", lambda: [empty])

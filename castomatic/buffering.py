@@ -51,6 +51,16 @@ MEASURE_SPOTS = 4  # places across the file to time, so one fast patch doesn't f
 MEASURE_SPOT_BYTES = 1024 * 1024
 MEASURE_TIMEOUT = 20.0  # a source that cannot do one read in this long counts as stalled
 CHUNK = 256 * 1024
+# A download someone else is running (a torrent) cannot be told what to fetch next, nor
+# trusted to arrive in order, so playback starts with this much in hand and is held when it
+# runs short, instead of waiting until the whole video is safe. A held renderer carries on
+# with a little more, so it is not stopping again a moment later.
+AHEAD_SECONDS = 20.0
+RESUME_SECONDS = 30.0
+# Video converted as it goes (HLS) reaches the renderer only a segment at a time, and a
+# segment only once ffmpeg has read a little past it: measured on a Chromecast, the
+# renderer stalled two segments short of the last whole keyframe group on disk
+EDGE_SECONDS = 2 * hls.SEGMENT_TARGET_SECONDS
 
 Status = Callable[[int, int, Optional[float]], None]  # (have bytes, needed bytes, bytes/s)
 
@@ -193,7 +203,7 @@ class CacheServer:
         """Initialize a new CacheServer."""
         self._cache = cache
         self._runner: Optional[web.AppRunner] = None
-        self._name = f"media{cache.path.suffix}"
+        self._name = f"media{getattr(cache, 'suffix', None) or cache.path.suffix}"
         self._mime = mimetypes.guess_type(self._name)[0] or "application/octet-stream"
 
     async def _handle(self, request: web.Request) -> web.StreamResponse:
@@ -306,6 +316,25 @@ class BufferedMedia:
         cache.start()
         return cls(cache, server, url)
 
+    @classmethod
+    async def following(cls, download: Any, index: Optional[mp4index.Mp4Index] = None) -> "BufferedMedia":
+        """Play a file something else is downloading (a :class:`~castomatic.torrent.TorrentFile`).
+
+        ``index``: its keyframe index, if already read.
+        """
+        server = CacheServer(download)
+        url = await server.start()
+        download.start()
+        media = cls(download, server, url)
+        if index is not None:
+            media.index, media._indexed = index, True
+        return media
+
+    @property
+    def external(self) -> bool:
+        """Whether something else fills the copy, in its own order (a torrent download)."""
+        return bool(getattr(self.cache, "external", False))
+
     @property
     def local_path(self) -> Path:
         """The copy on disk. Only whole once :attr:`cache` is complete."""
@@ -407,13 +436,26 @@ class BufferedMedia:
             await asyncio.sleep(0.5)
 
     async def fill_ahead(
-        self, offset: int, duration: float, on_status: Optional[Status] = None
+        self, offset: int, duration: float, on_status: Optional[Status] = None,
+        ahead: float = AHEAD_SECONDS,
     ) -> None:
-        """Wait until the copy ahead of ``offset`` lasts to the end at the current speed."""
+        """Wait until the copy ahead of ``offset`` lasts to the end at the current speed.
+
+        For a download someone else is running: until ``ahead`` seconds past it are here.
+        """
         cache = self.cache
         cache.hint(offset)
         bitrate = cache.size / max(duration, 1.0)
         remaining = cache.size - offset
+        if self.external:
+            need = self.bytes_ahead(offset, ahead + EDGE_SECONDS, duration)
+            while not cache.complete and cache.contiguous_from(offset) < need:
+                if cache.error:
+                    raise CacheError(cache.error)
+                if on_status:
+                    on_status(cache.contiguous_from(offset), need, cache.rate)
+                await asyncio.sleep(0.5)
+            return
         while not cache.complete:
             if cache.error:
                 raise CacheError(cache.error)
@@ -428,6 +470,18 @@ class BufferedMedia:
                 on_status(have, need, rate)
             await asyncio.sleep(0.5)
 
+    def bytes_ahead(self, offset: int, seconds: float, duration: float) -> int:
+        """Bytes from ``offset`` to ``seconds`` of video past it, to the keyframe after."""
+        size = self.cache.size
+        if self.index and self.index.frames:
+            frames = self.index.frames
+            at = next((pts for pts, _, where in reversed(frames) if where <= offset), 0.0)
+            later = [where for pts, _, where in frames if pts > at + seconds]
+            stop = later[0] if later else size
+        else:
+            stop = offset + int(seconds * size / max(duration, 1.0))
+        return max(0, min(size, stop) - offset)
+
     def lead_needed(self, offset: int, rate: float, duration: float) -> int:
         """Bytes to have past ``offset`` so the copy, at ``rate``, keeps ahead to the end.
 
@@ -440,6 +494,29 @@ class BufferedMedia:
         points.append((duration, self.cache.size))
         lead = max((at - offset) - rate * SAFETY * (pts - start) for pts, at in points)
         return int(min(self.cache.size - offset, max(0.0, lead)))
+
+    def seconds_ahead(self, seconds: float, duration: float) -> float:
+        """How many seconds of video past ``seconds`` can be played from what is here.
+
+        With the keyframe index this is exact: playback can go as far as the last keyframe
+        whose group of pictures is whole. (A busy scene can be several times the average
+        bitrate, so the average says little.)
+        """
+        offset = self.offset_at(seconds, duration)
+        end = offset + self.cache.contiguous_from(offset)
+        if end >= self.cache.size:
+            return max(0.0, duration - seconds)
+        if self.index and self.index.frames:
+            until = max((pts for pts, _, at in self.index.frames if at <= end), default=0.0)
+        else:
+            until = seconds + (end - offset) / (self.cache.size / max(duration, 1.0))
+        return max(0.0, until - seconds - (EDGE_SECONDS if self.external else 0.0))
+
+    def short_of(self, seconds: float, duration: float) -> bool:
+        """Whether playback at ``seconds`` is about to run out of video."""
+        if self.cache.complete:
+            return False
+        return self.seconds_ahead(seconds, duration) < min(LOW_WATER_SECONDS, duration - seconds)
 
     def running_dry(self, offset: int, duration: float) -> bool:
         """Whether playback at ``offset`` is about to overtake the copy."""

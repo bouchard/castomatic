@@ -60,6 +60,7 @@ The first run explains itself. In short:
 | --- | --- |
 | A file the TV can play | Sent **untouched**: the TV downloads the file itself, with seeking. |
 | A file the TV cannot play | **Remuxed or converted just in time** while the TV downloads it. Streams the TV understands are copied, so usually only the container changes, or only the audio is re-encoded. No temporary files. |
+| A file a torrent client is still downloading (`Movie.mkv.part`) | Read only where the download has really finished, each piece checked against the torrent's hashes. Waits, saying what for, until the parts every player needs first are here, then starts and **pauses the TV whenever the download falls behind**. See [Torrents still downloading](#torrents-still-downloading). |
 | A file on a slow drive or network share | Its read speed is measured first. If it cannot comfortably keep up, it plays through a local copy that stays ahead: **a short wait at the start instead of stalls part way**. Network shares are held to a higher bar. See [Slow files](#slow-files). |
 | A video address (`.mp4`, `.mkv`, `.m3u8`, ...) | Handed straight to the TV when it can fetch and play it. If the address downloads slower than the video plays, it is **buffered here first**, the same way. |
 | Any other page (YouTube, a live stream, ...) | [yt-dlp](https://github.com/yt-dlp/yt-dlp) streams it into a local buffer, and playback starts once the buffer cannot run dry. If yt-dlp cannot read the page and [castor](#castor-optional) is installed, castor finds the video instead. |
@@ -127,6 +128,7 @@ castomatic --forget                    # forget the remembered TV
 | `--tv TV`, `--choose`, `--forget`, `--list` | Pick a TV (see above) |
 | `--protocol {auto,chromecast,dlna,roku,airplay}` | How to reach the TV (default `auto`: see above) |
 | `--start SECONDS` | Start position |
+| `--torrent FILE` | The `.torrent` a file still downloading comes from, if it is not in the torrent client's folder |
 | `--mode {auto,direct,convert}` | `auto` sends untouched when possible, `direct` never converts, `convert` always does |
 | `--subtitles FILE` / `--no-subtitles` | Use this subtitle file, or send none |
 | `--burn-subtitles` | Draw the subtitles onto the picture. This re-encodes the video; it is for TVs that take no subtitle file, such as Roku |
@@ -350,6 +352,46 @@ video is reloaded where it was. A short interruption beats the video dying on th
 Copies live in `castomatic-cache-<user>/files` inside the system's temporary folder, which the
 OS clears on its own, so a copy lasts until then. When the disk is short of room the least recently used copies are removed; if there is still no room, the
 video plays directly from the file.
+
+### Torrents still downloading
+
+A torrent client fetches pieces in whatever order peers offer them, usually rarest first, so
+a file 80% downloaded can still have only its first minute in one piece. Played straight
+through, every missing piece is garbage on the screen. So a file named the way clients name
+unfinished files (`.part`, `.!qB`, `.!ut`, `.incomplete`), or given with `--torrent`, is read
+only where it has really finished:
+
+- **Which pieces are here** is checked against the hashes in the `.torrent`, which is found
+  in Transmission's, qBittorrent's or Deluge's own folder, or beside the file (`--torrent`
+  names it otherwise). Without one, a part counts once the client has written it (the file's
+  unwritten gaps say where it has not), which is less certain. It is checked again every
+  2 seconds as pieces arrive. Checking a 1.5 GB file takes under a second.
+- **Before anything starts**, the parts every player reads first must be here: the start of
+  the file (what is in it), and the keyframe index. An MP4's `moov` is often at the end, and
+  an MP4 cannot be played at all without it. A Matroska file's `Cues` say where each keyframe
+  is, needed to seek and to convert segment by segment. Castomatic says which of these it is
+  waiting for, and how the download is going, until they arrive:
+
+  ```
+  Still downloading: 78% downloaded (590 of 754 pieces), 22.0 MB of it in order from the start.
+  Cannot start yet. Waiting to download the MP4 index (moov) at the end of the file: an MP4 cannot play at all without it.
+  ```
+- **Then playback starts** with 20 seconds of video in hand, rather than waiting until the
+  rest is sure to arrive in time: from a torrent, it rarely is. Video that is converted as it
+  goes reaches the TV a segment at a time, so another 12 seconds are kept as a margin.
+- **While playing**, if the TV gets within 10 seconds of a missing piece, or stops moving
+  while it waits for one, it is paused until 30 seconds more have arrived, then resumed. A TV
+  that gives up waiting anyway (a Chromecast does, after a minute or two) is started again
+  where it stopped, once that part is here. If nothing arrives for 30 seconds, Castomatic
+  asks whether the torrent is paused.
+
+When the download finishes and the client renames the file (dropping `.part`) or moves it
+to its final folder, playback carries on undisturbed: the file is read through the copy
+opened at the start, whatever its name. Given a `.part` name that has since been renamed,
+Castomatic plays the finished file.
+
+Switching on the client's sequential download (Transmission 4.1 and qBittorrent both have
+it) makes all of this smooth: pieces then arrive in the order they are played.
 
 ## Library use
 
